@@ -73,7 +73,7 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
 
     No fallback
     -----------
-    If BayCon returns nothing valid, we do NOT fall back to t_seed (the
+    If BayCon returns nothing valid, we do not fall back to t_seed (the
     guaranteed-valid centroid move for Ward) -- we report that no
     counterfactual was found: A_prime is None and info['found'] is False.
 
