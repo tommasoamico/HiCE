@@ -38,23 +38,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 from dice_ml import Dice, Data, Model
-
-
-# ======================================================================
-# Linkage distances (kept local so dice.py is self-contained)
-# ======================================================================
-def _ward_d(P, Q):
-    nP, nQ = len(P), len(Q)
-    c = np.sqrt(2.0 * nP * nQ / (nP + nQ))
-    return float(c * np.linalg.norm(P.mean(0) - Q.mean(0)))
-
-
-def _complete_d(P, Q):
-    return float(cdist(P, Q, metric='euclidean').max())
-
-
-def _dist(P, Q, linkage):
-    return _ward_d(P, Q) if linkage == 'ward' else _complete_d(P, Q)
+from modules.utilityFunctions import distLinkage, wardDistance, complete_linkage_max
 
 
 # ======================================================================
@@ -93,10 +77,10 @@ class ConstraintClassifier:
 
     def _margin(self, t):
         Ap = self.A + t
-        dB = _dist(Ap, self.B, self.linkage)
+        dB = distLinkage(Ap, self.B, self.linkage)
         if not self.comp:
             return 1.0                            # no competitors -> trivially valid
-        return min(_dist(Ap, X, self.linkage) - dB for X in self.comp)
+        return min(distLinkage(Ap, X, self.linkage) - dB for X in self.comp)
 
     def predict(self, T):
         T = np.atleast_2d(np.asarray(T, float))
@@ -141,13 +125,12 @@ def run_dice_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     If, despite the seed, the frame is still one-class (shouldn't happen for
     Ward), we augment with a uniform box sample as a safety net.
  
-    Fallback
-    --------
-    If DiCE returns nothing valid, we fall back to t_seed itself (the
-    guaranteed-valid centroid move for Ward), so the Ward DiCE baseline never
-    returns infeasible; info['used_fallback'] flags this. The informative metric
-    is then how much CLOSER than t_seed DiCE managed to get.
- 
+    No fallback
+    -----------
+    If DiCE returns nothing valid, we do NOT fall back to t_seed (the
+    guaranteed-valid centroid move for Ward) -- we report that no
+    counterfactual was found: A_prime is None and info['found'] is False.
+
     Parameters
     ----------
     A_pts, B_pts : (n_A, d), (n_B, d).
@@ -155,14 +138,14 @@ def run_dice_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     linkage : {'ward', 'complete'} (complete not yet supported here).
     X_all : (n, d)   the full dataset, used to build data-grounded t-ranges.
     mu_A : (d,), optional   A's centroid (defaults to A_pts.mean(0)).
- 
+
     Returns
     -------
-    A_prime : (n_A, d)
-    info : dict  t, feasible (exact recheck), distance_moved, used_fallback,
+    A_prime : (n_A, d) or None if no valid counterfactual was found.
+    info : dict  t, feasible (exact recheck), distance_moved, found,
                  n_cfs_returned, method.
     """
-    import dice_ml
+    
     from dice_ml import Dice, Data, Model
  
     A_pts = np.asarray(A_pts, float)
@@ -224,18 +207,23 @@ def run_dice_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     except Exception:
         best_t = None
  
-    # ---- guaranteed-valid fallback (Ward): the centroid move ----
-    used_fallback = False
+    # ---- no fallback: report failure to find a counterfactual as such ----
     if best_t is None:
-        best_t = t_seed
-        used_fallback = True
- 
+        return None, {
+            "t": None,
+            "feasible": False,
+            "distance_moved": None,
+            "found": False,
+            "n_cfs_returned": n_ret,
+            "method": "dice-genetic",
+        }
+
     valid = bool(clf.predict([best_t])[0])          # exact recheck
     return A_pts + best_t, {
         "t": best_t,
         "feasible": valid,
         "distance_moved": float(np.linalg.norm(best_t)),
-        "used_fallback": used_fallback,
+        "found": True,
         "n_cfs_returned": n_ret,
         "method": "dice-genetic",
     }

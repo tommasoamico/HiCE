@@ -274,6 +274,15 @@ def ward_info(t, feasible_, optimal_, n_comp, active_balls, phase=''):
     }
 
 
+def wardDistance(P, Q):
+    nP, nQ = len(P), len(Q)
+    c = np.sqrt(2.0 * nP * nQ / (nP + nQ))
+    return float(c * np.linalg.norm(P.mean(0) - Q.mean(0)))
+
+
+def distLinkage(P, Q, linkage):
+    return wardDistance(P, Q) if linkage == 'ward' else complete_linkage_max(P, Q, metric_='euclidean')
+
 
 # we can reuse a lot of distances here instead of computing cdist every time, need to implement
 # it across the whole pipeline
@@ -305,7 +314,7 @@ def _dominates(A_prime, B_pts, competitor_pts_list, linkage, eps):
             nS = len(P)
             c = np.sqrt(2.0 * nA * nS / (nA + nS))
             return c * np.linalg.norm(muA - P.mean(axis=0))
-
+        
         dB = wd(B_pts)
         for Xp in competitor_pts_list:
             if not (dB < wd(Xp) - eps):
