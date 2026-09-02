@@ -34,6 +34,7 @@ from modules.hiceCounterfactuals import hiceCounterfactuals
 from modules.utilityFunctions import _dominates, detect_column_types, load_synthetic        
 from modules.metrics import proximity, validity
 from modules.dice import run_dice_baseline
+from modules.baycon import run_baycon_baseline
 
 # ======================================================================
 # Column-type detection + metric resolution
@@ -86,8 +87,26 @@ def load_openml(name, linkage):
 # ======================================================================
 # Main loop
 # ======================================================================
+def _already_in_csv(out_csv, dataset_label, linkage):
+    import os
+    if not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
+        return False
+    with open(out_csv, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('dataset') == dataset_label and row.get('linkage') == linkage:
+                return True
+    return False
+
+
 def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
-        synthetic=False, seed=0, eps=0.0, run_dice=True):
+        synthetic=False, seed=0, eps=0.0, run_dice=True, run_baycon=True):
+    dataset_label = dataset if not synthetic else 'synthetic'
+    if _already_in_csv(out_csv, dataset_label, linkage):
+        print(f"[skip] '{dataset_label}' (linkage={linkage}) already present in "
+              f"{out_csv}, skipping run.")
+        return []
+
     if synthetic:
         X = load_synthetic(seed=seed); metric, types = 'euclidean', {}
         print(f"[data] synthetic: {X.shape} (metric=euclidean)")
@@ -106,10 +125,12 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
     # one class instance, reused across all pairs
     cf = hiceCounterfactuals(X=X, Z=Z, metric=metric, linkage=linkage, anchor='min')
 
-    # which methods to run: DiCE is Ward-only for now (complete seed not implemented)
+    # which methods to run: DiCE/BayCon are Ward-only for now (complete seed not implemented)
     which_list = ['method', 'baseline']
     if run_dice and linkage == 'ward' and metric == 'euclidean':
         which_list.append('dice')
+    if run_baycon and linkage == 'ward' and metric == 'euclidean':
+        which_list.append('baycon')
 
     pairs = cf.enumerate_pairs(min_leaf, max_leaf, max_pairs, seed=seed)
     print(f"[pairs] testing {len(pairs)} (A,B) pairs; methods={which_list}")
@@ -130,6 +151,10 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
                     A_prime, info = cf.baseline(B_leaves=B_lv, A_leaves=A_lv)
                 elif which == 'dice':
                     A_prime, info = run_dice_baseline(
+                        A_pts, B_pts, comp_pts, linkage, X_all=X,
+                        mu_A=A_pts.mean(0), eps=eps)
+                elif which == 'baycon':
+                    A_prime, info = run_baycon_baseline(
                         A_pts, B_pts, comp_pts, linkage, X_all=X,
                         mu_A=A_pts.mean(0), eps=eps)
                 secs = time.perf_counter() - t0
@@ -159,7 +184,7 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
             prox = proximity(info if isinstance(info, dict) else {}, A_pts, A_prime, metric)
 
             rows.append(dict(
-                dataset=dataset if not synthetic else 'synthetic',
+                dataset=dataset_label,
                 linkage=linkage, metric=metric,
                 pair_idx=idx, which=which,
                 n_A=len(A_lv), n_B=len(B_lv), n_competitors=len(comps_leaves),
@@ -180,10 +205,14 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
             print(f"  ... {idx+1}/{len(pairs)}")
 
     if rows:
-        with open(out_csv, 'w', newline='') as f:
+        import os
+        file_exists = os.path.exists(out_csv) and os.path.getsize(out_csv) > 0
+        with open(out_csv, 'a', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader(); w.writerows(rows)
-        print(f"[out] wrote {len(rows)} rows to {out_csv}")
+            if not file_exists:
+                w.writeheader()
+            w.writerows(rows)
+        print(f"[out] appended {len(rows)} rows to {out_csv}")
     _summary(rows, linkage)
     return rows
 

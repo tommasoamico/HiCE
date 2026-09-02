@@ -26,7 +26,7 @@ Key design choices (mirrors dice.py):
 
   * BayCon's DataAnalyzer needs feature ranges/bounds and a labelled pool to
     bootstrap its neighbourhood sampling. We build that pool the same way as
-    the DiCE baseline: the REAL dataset expressed as translations,
+    the DiCE baseline: the real dataset expressed as translations,
     t_i = x_i - mu_A (data-grounded ranges, on-manifold seeding), PLUS a
     guaranteed-valid seed (Ward: t_seed = mu_B - mu_A).
 
@@ -73,8 +73,9 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
 
     No fallback
     -----------
-    If BayCon returns nothing valid, we do not fall back to t_seed (the
-    guaranteed-valid centroid move for Ward) -- we report that no
+    If BayCon returns nothing valid, we do not
+      fall back to t_seed (the
+    guaranteed-valid centroid move for Ward); we report that no
     counterfactual was found: A_prime is None and info['found'] is False.
 
     Parameters
@@ -119,6 +120,7 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
 
     # safety net: if still one-class (shouldn't happen for Ward, since t_seed is
     # valid and t=0 is invalid), augment with a uniform box sample.
+    # We need examples from the other calss for the surrogate
     if len(set(y_pool.tolist())) < 2:
         rng = np.random.default_rng(seed)
         T_box = rng.uniform(-t_bound, t_bound, size=(n_train, d))
@@ -135,7 +137,7 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
 
     best_t, n_ret = None, 0
     try:
-        counterfactuals, _ranker = baycon_gen.run(
+        counterfactuals, _ = baycon_gen.run(
             initial_instance, initial_prediction, target, data_analyzer, clf)
         n_ret = len(counterfactuals)
         if n_ret:
