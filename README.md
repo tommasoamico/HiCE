@@ -38,14 +38,4 @@ Key options: `--min-leaf` / `--max-leaf` bound the size of branches considered,
 `--max-pairs` caps the number of `(A, B)` pairs evaluated, `--eps` sets the
 domination margin, and `--seed` controls pair sampling.
 
-## Requirements
 
-Python with `numpy`, `scipy`, `pandas`, `openml`, `miniball`, `cvxpy`, and
-`gurobipy` (Gurobi with a valid license) for the exact solver; `dice-ml` if
-running the DiCE baseline.
-
-## Data
-
-The `data/` directory holds local datasets used by the experiments and is
-excluded from version control (see `.gitignore`) — it is not meant to be
-distributed through this repository.
