@@ -30,10 +30,17 @@ Usage
 -----
     python runHierarchical.py --dataset iris --linkage ward --out results.csv
     python runHierarchical.py --dataset iris --linkage ward --out results.csv --no-dice
+    python runHierarchical.py --dataset iris wine breast-w --linkage ward --out results.csv
     python runHierarchical.py --linkage ward --synthetic          # offline
+
+Multiple datasets
+-----------------
+--dataset accepts one or more names; all methods are run for each dataset in
+turn and appended to the SAME --out file (resumable per-(dataset, method) as
+usual).
 """
 
-import argparse, time, csv, sys, os
+import argparse, time, csv, sys, os, random, hashlib
 import numpy as np
 from scipy.cluster.hierarchy import linkage as scipy_linkage
 
@@ -84,6 +91,33 @@ def load_openml(name, linkage):
 
 
 # ======================================================================
+# Reproducibility helpers
+# ======================================================================
+def _seed_everything(seed):
+    """Seed every global RNG a competitor baseline might reach for (both
+    baycon and DiCE-genetic draw from the GLOBAL numpy/python random state,
+    not a local Generator), so a call is reproducible on its own."""
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def call_seed(dataset_label, linkage, base_seed, pair_idx, which):
+    """
+    Deterministic per-(dataset, linkage, base_seed, pair_idx, which) seed in
+    [0, 2**32). Depends ONLY on these five values (not on run order, other
+    methods, or anything upstream), so re-deriving it later reproduces the
+    exact seed used originally -- e.g. to replay just the BayCon run for one
+    pair in isolation: recompute the pair with the same (dataset, linkage,
+    base_seed, min_leaf, max_leaf, max_pairs) via enumerate_pairs, take
+    pair_idx, then call `_seed_everything(call_seed(...))` followed by
+    `run_baycon_baseline(..., seed=call_seed(...))`.
+    """
+    key = f"{dataset_label}|{linkage}|{base_seed}|{pair_idx}|{which}"
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    return int(digest[:8], 16)
+
+
+# ======================================================================
 # Per-method presence check (for resumable, append-only runs)
 # ======================================================================
 def _methods_in_csv(out_csv, dataset_label, linkage):
@@ -106,7 +140,7 @@ def _methods_in_csv(out_csv, dataset_label, linkage):
 # Main loop
 # ======================================================================
 def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
-        synthetic=False, seed=0, eps=0.0, run_dice=True, run_baycon=True):
+        synthetic=False, seed=0, eps=0.0, run_hice=True, run_dice=True, run_baycon=True):
     dataset_label = dataset if not synthetic else 'synthetic'
 
     if synthetic:
@@ -128,7 +162,10 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
     cf = hiceCounterfactuals(X=X, Z=Z, metric=metric, linkage=linkage, anchor='min')
 
     # full set of methods we'd run for this config
-    which_list = ['method', 'baseline']
+    which_list = []
+    if run_hice:
+        which_list.append('method')
+    which_list.append('baseline')
     if linkage == 'ward':
         which_list.append('baseline2')
     if run_dice and linkage == 'ward' and metric == 'euclidean':
@@ -156,6 +193,13 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
         comp_pts = [X[sorted(c)] for c in comps_leaves]
 
         for which in to_run:
+            # deterministic per-(dataset, linkage, seed, pair, which) seed,
+            # independent of run order -- reseed every global RNG a
+            # competitor baseline might touch right before calling it, so
+            # the call is reproducible standalone later (see call_seed()).
+            cseed = call_seed(dataset_label, linkage, seed, idx, which)
+            _seed_everything(cseed)
+
             err = ''; A_prime = None; info = {}; secs = np.nan
             try:
                 t0 = time.perf_counter()
@@ -168,11 +212,11 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
                 elif which == 'dice':
                     A_prime, info = run_dice_baseline(
                         A_pts, B_pts, comp_pts, linkage, X_all=X,
-                        mu_A=A_pts.mean(0), eps=eps)
+                        mu_A=A_pts.mean(0), eps=eps, seed=cseed)
                 elif which == 'baycon':
                     A_prime, info = run_baycon_baseline(
                         A_pts, B_pts, comp_pts, linkage, X_all=X,
-                        mu_A=A_pts.mean(0), eps=eps)
+                        mu_A=A_pts.mean(0), eps=eps, seed=cseed)
                 secs = time.perf_counter() - t0
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
@@ -185,6 +229,7 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
                 dataset=dataset_label,
                 linkage=linkage, metric=metric,
                 pair_idx=idx, which=which,
+                base_seed=seed, call_seed=cseed,
                 n_A=len(A_lv), n_B=len(B_lv), n_competitors=len(comps_leaves),
                 s_A=s_A, s_B=s_B, s_star=s_star,
                 valid=int(valid),
@@ -281,7 +326,9 @@ def _summary(rows, linkage):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dataset', type=str, default='iris')
+    ap.add_argument('--dataset', type=str, nargs='+', default=['iris'],
+                     help="one or more OpenML dataset names; all methods are "
+                          "run for each, appended to the same --out file")
     ap.add_argument('--linkage', choices=['complete', 'ward'], required=True)
     ap.add_argument('--out', type=str, default='results.csv')
     ap.add_argument('--min-leaf', type=int, default=1)
@@ -290,12 +337,22 @@ def main():
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--eps', type=float, default=0.0)
     ap.add_argument('--synthetic', action='store_true')
+    ap.add_argument('--no-hice', action='store_true', help="disable the HiCE method itself")
     ap.add_argument('--no-dice', action='store_true', help="disable the DiCE baseline")
     ap.add_argument('--no-baycon', action='store_true', help="disable the BayCon baseline")
     a = ap.parse_args()
-    run(a.dataset, a.linkage, a.out, a.min_leaf, a.max_leaf, a.max_pairs,
-        synthetic=a.synthetic, seed=a.seed, eps=a.eps,
-        run_dice=not a.no_dice, run_baycon=not a.no_baycon)
+
+    if a.synthetic:
+        run(None, a.linkage, a.out, a.min_leaf, a.max_leaf, a.max_pairs,
+            synthetic=True, seed=a.seed, eps=a.eps,
+            run_hice=not a.no_hice, run_dice=not a.no_dice, run_baycon=not a.no_baycon)
+        return
+
+    for dataset in a.dataset:
+        print(f"\n===== dataset: {dataset} =====")
+        run(dataset, a.linkage, a.out, a.min_leaf, a.max_leaf, a.max_pairs,
+            synthetic=False, seed=a.seed, eps=a.eps,
+            run_hice=not a.no_hice, run_dice=not a.no_dice, run_baycon=not a.no_baycon)
 
 
 if __name__ == '__main__':

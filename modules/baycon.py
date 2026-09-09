@@ -37,6 +37,8 @@ Key design choices (mirrors dice.py):
     implemented here (raises NotImplementedError, matching dice.py).
 """
 
+import random
+
 import numpy as np
 
 import baycon.baycon.bayesian_generator as baycon_gen
@@ -92,6 +94,14 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     info : dict  t, feasible (exact recheck), distance_moved, found,
                  n_cfs_returned, method.
     """
+
+    # BayCon's exploration (InstancesGenerator.generate_random, etc.) draws
+    # from the GLOBAL numpy/python random state (no local Generator to pass
+    # in), so reseed both here -- this makes a standalone call with the same
+    # `seed` and inputs fully reproducible, independent of whatever ran
+    # before it.
+    random.seed(seed)
+    np.random.seed(seed)
 
     A_pts = np.asarray(A_pts, float)
     B_pts = np.asarray(B_pts, float)

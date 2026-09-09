@@ -34,6 +34,8 @@ Key design choices (see the accompanying discussion):
 
 """
 
+import random
+
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
@@ -147,7 +149,14 @@ def run_dice_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     """
     
     from dice_ml import Dice, Data, Model
- 
+
+    # DiCE's genetic search draws from the GLOBAL numpy/python random state
+    # (no local Generator to pass in), so reseed both here -- this makes a
+    # standalone call with the same `seed` and inputs fully reproducible,
+    # independent of whatever ran before it.
+    random.seed(seed)
+    np.random.seed(seed)
+
     A_pts = np.asarray(A_pts, float)
     B_pts = np.asarray(B_pts, float)
     X_all = np.asarray(X_all, float)
