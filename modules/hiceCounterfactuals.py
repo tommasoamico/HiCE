@@ -133,7 +133,50 @@ class hiceCounterfactuals:
         }
         return A_prime, info
 
-        
+    def baseline2(self, B_leaves: List[int], A_leaves: List[int]):
+        """
+        Second baseline, ward-only: rigidly translate branch A so its
+        representative (centroid mu_A) lands on B's representative (centroid
+        mu_B), instead of B's nearest sample as in `baselineWard`/`baseline`.
+
+            t  = mu_B - mu_A
+            A' = A + t
+
+        Returns
+        -------
+        A_prime : np.ndarray (n_A x d)
+        info : dict  (t, distance_moved, ward_distance_to_B, and the
+                    Ward-native centroid->centroid move for comparison)
+        """
+        if self.linkage != 'ward':
+            raise ValueError(
+                f"baseline2 is only defined for linkage='ward' (got {self.linkage!r}).")
+
+        A_leaves_sorted = sorted(int(l) for l in A_leaves)
+        B_leaves_sorted = sorted(int(l) for l in B_leaves)
+
+        A_pts = np.asarray(self.X[A_leaves_sorted], dtype=float)
+        B_pts = np.asarray(self.X[B_leaves_sorted], dtype=float)
+
+        mu_A = A_pts.mean(axis=0)
+        mu_B = B_pts.mean(axis=0)
+
+        t = mu_B - mu_A
+        A_prime = A_pts + t
+
+        def ward_dist(P, Q):
+            nP, nQ = len(P), len(Q)
+            c = np.sqrt(2.0 * nP * nQ / (nP + nQ))
+            return float(c * np.linalg.norm(P.mean(0) - Q.mean(0)))
+
+        info = {
+            "t": t,
+            "distance_moved": float(np.linalg.norm(t)),
+            "ward_distance_to_B": ward_dist(A_prime, B_pts),
+            "A_leaves_sorted": A_leaves_sorted,
+            "metric": "ward",
+        }
+        return A_prime, info
 
 
     # ======================================================================
@@ -228,7 +271,7 @@ class hiceCounterfactuals:
             # to change the geometry of the solve.
             movedBranch, info = self.counterfactual_ward_branch(
                 B_leaves=B_leaves, A_leaves=A_leaves, anchor=self.anchor,
-                index_to_name=getattr(self, 'index_to_name', None)
+                index_to_name=getattr(self, 'index_to_name', None), sparsity=True
             )
         else:
             raise ValueError(f"Unsupported linkage {self.linkage!r}; use 'complete' or 'ward'.")
@@ -238,163 +281,170 @@ class hiceCounterfactuals:
 
     def counterfactual_ward_branch(self, B_leaves, A_leaves,
                                anchor='min', eps=1e-6, index_to_name=None,
-                               exhaustive=False, socp_solver=None, verbose=False):
+                               exhaustive=False, socp_solver=None,
+                               sparsity=True, lam=1.0, verbose=False):
         """
         Ward-linkage counterfactual: rigidly translate branch A by t so A becomes
-        Ward-closer to target branch B than to every live competitor, minimizing
-        ||t||^2.
-    
-        Ward distance to a cluster S is c_{AS} ||mu_A + t - mu_S|| with
-        c_{AS} = sqrt(2 n_A n_S / (n_A + n_S)) — measured to the CENTROID, so
-        there is no farthest-member max and no witness disjunction. With
-        p = mu_A + t, each competitor X gives one Apollonius constraint whose type
-        is fixed by size (w_S = c_{AS}^2 increasing in n_S):
-    
-            n_X < n_B : ball INTERIOR   ||p - kappa_X|| <= R_X   (convex, SOC)
-            n_X = n_B : half-space                               (convex, linear)
-            n_X > n_B : ball EXTERIOR   ||p - kappa_X|| >= R_X   (reverse-convex)
-    
-        Feasible region = convex body K (interiors + half-spaces) with the
-        reverse-convex balls carved out. Ward is ALWAYS feasible (mu_B lies in it),
-        so ||t*|| <= ||mu_B - mu_A||.
-    
-        Algorithm
+        Ward-closer to target branch B than to every live competitor.
+
+        Objective
         ---------
-        Phase 1  project mu_A onto K                    (cvxpy SOCP — rigorous)
-        Phase 2  screen reverse-convex balls
-        Phase 3  greedy deepest-first repair onto sphere ∩ K   (fast path)
-        Phase 4  active-set enumeration on cycle/infeasibility  (certified backstop)
-    
+        sparsity=False (default): minimize ||t||^2  (least Euclidean displacement).
+        sparsity=True            : minimize ||t||^2 + lam * ||t||_1  (elastic net),
+                                which drives coordinates of t to exact zero,
+                                yielding a FEATURE-SPARSE counterfactual. lam is
+                                the sparsity weight; lam=0 recovers the L2 case.
+
+        Geometry (objective-independent)
+        --------------------------------
+        Ward distance to a cluster S is c_{AS} ||mu_A + t - mu_S|| with
+        c_{AS}=sqrt(2 n_A n_S/(n_A+n_S)) (centroid distance). With p = mu_A + t each
+        competitor gives one Apollonius constraint, typed by size (w_S = c_{AS}^2):
+            n_X < n_B : ball INTERIOR   ||p-kappa_X|| <= R_X   (convex, SOC)
+            n_X = n_B : half-space                              (convex, linear)
+            n_X > n_B : ball EXTERIOR   ||p-kappa_X|| >= R_X   (reverse-convex)
+        Feasible region = convex body K minus the reverse-convex balls. Always
+        feasible (mu_B in it). The L1 term changes ONLY the objective, never the
+        constraints, so the Apollonius geometry is identical for both objectives.
+
+        Exactness note under sparsity
+        -----------------------------
+        For the pure-L2 objective the reverse-convex sphere repair is EXACT (the
+        single-active-ball case is solved by the radial closed form, or the tight
+        S-lemma SDP when K binds). NEITHER tool survives the L1 term: the radial
+        projection is L2-specific, and the Shor/S-lemma SDP is NOT tight for a
+        quadratic-plus-L1 objective (its relaxation becomes loose). So with
+        sparsity=True the single-sphere repair falls back to multistart SLSQP on the
+        L2^2+lam*L1 objective, which is a heuristic (no global certificate) for the
+        reverse-convex phases. Phase 1 (the convex projection) remains exact under
+        L1, since adding lam*||t||_1 keeps it a convex program. In practice most
+        instances resolve in Phase 1; the certificate is only weakened on the rarer
+        sphere-binding instances.
+
         Parameters
         ----------
-        exhaustive : bool
-            Phase-4 behaviour when it is entered (it usually is NOT — most
-            instances resolve in Phase 1/3).
-            False (default): grow active-set size k = 1,2,... and STOP at the
-                first k that yields a feasible candidate, taking the closest.
-                Cheaper; can miss a larger-active-set optimum in rare degenerate
-                cases (not certified global there).
-            True: check ALL active-set sizes up to min(d, m) and take the global
-                best. Certified global. Costs sum_{i<=min(d,m)} C(m,i) *only when
-                Phase 4 runs* (the rare multi-ball-active case); Phases 1-3 are
-                unchanged, so typical instances pay nothing extra.
-        socp_solver : cvxpy solver constant, optional
-            Override the SOCP solver (default: CLARABEL, else ECOS).
-    
+        sparsity : bool     use the L2^2 + lam*L1 elastic-net objective.
+        lam : float         L1 weight (only used when sparsity=True).
+        exhaustive : bool   Phase-4 behaviour (see below).
+        socp_solver : cvxpy solver constant, optional (default CLARABEL, else ECOS).
+
         Returns
         -------
         A_prime : np.ndarray (n_A x d)
         info : dict  t, feasible, optimal, distance_moved, n_competitors,
-                    active_balls, phase (which phase produced the answer).
+                    active_balls, phase, plus sparsity/lam echoed back.
         """
         n = len(self.X)
         d = self.X.shape[1]
-    
+
         # ---- Step 0: resolve A, B as static wholes ----
         A_node, A_leaves_sorted, s_A = self._resolve_branch(A_leaves)
         B_node, B_leaves_sorted, s_B = self._resolve_branch(B_leaves)
         if A_node == B_node:
             raise ValueError("A_leaves and B_leaves resolve to the same node.")
-    
+
         A_pts = np.asarray(self.X[A_leaves_sorted], dtype=float)
         B_pts = np.asarray(self.X[B_leaves_sorted], dtype=float)
         n_A, n_B = len(A_pts), len(B_pts)
         mu_A = A_pts.mean(axis=0)
         mu_B = B_pts.mean(axis=0)
-    
+
         def w(nS):
             return 2.0 * n_A * nS / (n_A + nS)
         w_B = w(n_B)
-    
+
         # ---- Step 1: anchor + live partition ----
         if anchor != 'min':
             raise NotImplementedError("Only anchor='min' (s* = min(s_A, s_B)) is implemented.")
         s_star = min(s_A, s_B)
         live_partition = self._alive_clusters_before_row(s_star + 1)
-    
+
         # ---- Step 2: competitor set ----
         A_set, B_set = set(A_leaves_sorted), set(B_leaves_sorted)
         competitor_nodes = {nid: leaves for nid, leaves in live_partition.items()
                             if not (set(leaves) <= A_set or set(leaves) <= B_set)}
-    
+
         if verbose:
             print(f"n_A={n_A}(s_A={s_A}) n_B={n_B}(s_B={s_B}) s*={s_star} "
-                f"competitors={len(competitor_nodes)}")
-    
+                f"competitors={len(competitor_nodes)} sparsity={sparsity} lam={lam}")
+
         if not competitor_nodes:
-            return A_pts.copy(), ward_info(np.zeros(d), True, True,
-                                            0, [], "guard-no-competitors")
-    
-        # ---- Apollonius data ----
+            info = ward_info(np.zeros(d), True, True, 0, [], "guard-no-competitors")
+            info["sparsity"] = sparsity; info["lam"] = lam if sparsity else 0.0
+            return A_pts.copy(), info
+
+        # ---- Apollonius data (objective-independent) ----
         convex_ball_in = []   # (kappa, R)         ||p-kappa|| <= R
         convex_half = []      # (a, b)             a·p <= b
         rev_balls = []        # {kappa, R, nid}    ||p-kappa|| >= R  (reverse-convex)
-    
+
         for nid, leaves in competitor_nodes.items():
             mu_X = np.asarray(self.X[leaves], dtype=float).mean(axis=0)
             n_X = len(leaves)
             coeff = w_B - w(n_X)
             bvec = w_B * mu_B - w(n_X) * mu_X
             cval = w_B * (mu_B @ mu_B) - w(n_X) * (mu_X @ mu_X)
-    
             if abs(coeff) < 1e-12:
-                # half-space: -2<p,bvec> + cval <= 0  ->  (-2 bvec)·p <= -cval
                 convex_half.append((-2.0 * bvec, -cval))
             else:
                 kappa = bvec / coeff
                 R = np.sqrt(max(kappa @ kappa - cval / coeff, 0.0))
-                if coeff > 0:
-                    convex_ball_in.append((kappa, R))
-                else:
-                    rev_balls.append({'kappa': kappa, 'R': R, 'nid': nid})
-    
-        rho = float(np.linalg.norm(mu_B - mu_A))
-    
-        # ---- solver selection ----
+                (convex_ball_in if coeff > 0 else rev_balls).append(
+                    (kappa, R) if coeff > 0 else {'kappa': kappa, 'R': R, 'nid': nid})
+
+        #rho = float(np.linalg.norm(mu_B - mu_A))
+
         if socp_solver is None:
             socp_solver = cp.CLARABEL if hasattr(cp, "CLARABEL") else cp.ECOS
-    
-        # ---- convex projection onto K (rigorous SOCP) ----
+
+        # ---- objective helper (numeric, for scoring / SLSQP) ----
+        def obj_val(p):
+            t = p - mu_A
+            v = float(t @ t)
+            if sparsity:
+                v += lam * float(np.sum(np.abs(t)))
+            return v
+
+        # ---- convex projection onto K (SOCP; + L1 term if sparsity) ----
         def project_K_socp():
             p = cp.Variable(d)
             cons = []
             for (kappa, R) in convex_ball_in:
-                cons.append(cp.norm(p - kappa) <= R)          # second-order cone
+                cons.append(cp.norm(p - kappa) <= R)
             for (a, b) in convex_half:
-                cons.append(a @ p <= b)                        # linear
-            prob = cp.Problem(cp.Minimize(cp.sum_squares(p - mu_A)), cons)
+                cons.append(a @ p <= b)
+            objective = cp.sum_squares(p - mu_A)
+            if sparsity:
+                objective = objective + lam * cp.norm1(p - mu_A)   # elastic net
+            prob = cp.Problem(cp.Minimize(objective), cons)
             prob.solve(solver=socp_solver)
             if p.value is None:
-                return mu_A.copy()      # K infeasible shouldn't happen (mu_B in K); fall back
+                return mu_A.copy()
             return np.asarray(p.value, dtype=float)
-    
+
+        # ---- sphere ∩ K projection ----
         def project_spheres_capK(active_spheres, n_restarts=8):
             """
-            Project mu_A onto (spheres' surfaces) ∩ K.
-        
-            SINGLE sphere:
-                (1) closed-form radial foot; if it satisfies K -> exact, return it;
-                (2) else certified S-lemma SDP for sphere ∩ K -> exact, return it;
-                (3) else multistart SLSQP backstop.
-            MULTIPLE spheres:
-                multistart SLSQP (S-lemma not guaranteed tight for >= 2 quadratics).
+            L2 objective, single sphere:
+                (1) closed-form radial foot if it lies in K (exact);
+                (2) else S-lemma SDP (exact); (3) else SLSQP backstop.
+            L1 objective (sparsity=True): the radial foot and the S-lemma SDP are
+            NOT valid (radial is L2-only; the Shor SDP is not tight with an L1
+            term), so we go straight to multistart SLSQP on L2^2+lam*L1.
+            Multiple spheres: multistart SLSQP either way.
             """
-            # ---------------- single active sphere ----------------
-            if len(active_spheres) == 1:
+            # ---- single sphere, pure L2: exact fast paths ----
+            if len(active_spheres) == 1 and not sparsity:
                 kappa, R = active_spheres[0]
-        
-                # (1) closed form; optimal iff the radial foot already lies in K
                 p_cf = project_sphere_closed_form(mu_A, kappa, R)
                 if feasible(p_cf, convex_ball_in, convex_half, rev_balls):
                     return p_cf
-        
-                # (2) K cuts the radial foot -> certified SDP for sphere ∩ K
                 p_sdp = project_single_sphere_sdp(mu_A, kappa, R, convex_ball_in, convex_half)
                 if p_sdp is not None and feasible(p_sdp, convex_ball_in, convex_half, rev_balls):
                     return p_sdp
-                # (3) fall through to SLSQP backstop below
-        
-            # ---------------- multi-sphere, or single-sphere backstop ----------------
+                # fall through to SLSQP
+
+            # ---- SLSQP on the (possibly L1) objective ----
             eq_cons = [{'type': 'eq',
                         'fun': (lambda p, k=k, R=R: np.linalg.norm(p - k) - R)}
                     for (k, R) in active_spheres]
@@ -406,7 +456,7 @@ class hiceCounterfactuals:
                 ineq_cons.append({'type': 'ineq',
                                 'fun': (lambda p, a=a, b=b: b - a @ p)})
             cons = eq_cons + ineq_cons
-        
+
             rng = np.random.default_rng(0)
             starts = []
             k0, R0 = active_spheres[0]
@@ -415,31 +465,48 @@ class hiceCounterfactuals:
             starts.append(k0 + R0 * (dirc / nrm if nrm > 1e-12 else unit(d, rng)))
             for _ in range(n_restarts - 1):
                 starts.append(k0 + R0 * unit(d, rng))
-        
+
+            # objective + gradient; L1 uses a smooth-ish subgradient (sign), which
+            # SLSQP tolerates in practice with multistart.
+            def fobj(p):
+                return obj_val(p)
+            def fjac(p):
+                t = p - mu_A
+                g = 2.0 * t
+                if sparsity:
+                    g = g + lam * np.sign(t)
+                return g
+
             best, best_val = None, np.inf
             for s in starts:
-                res = minimize(lambda p: np.sum((p - mu_A) ** 2), s, method='SLSQP',
-                            jac=lambda p: 2 * (p - mu_A),
+                res = minimize(fobj, s, method='SLSQP', jac=fjac,
                             constraints=cons, options={'maxiter': 400, 'ftol': 1e-12})
                 if res.success and feasible(res.x, convex_ball_in, convex_half, rev_balls):
-                    val = float(np.sum((res.x - mu_A) ** 2))
+                    val = obj_val(res.x)
                     if val < best_val:
                         best_val, best = val, res.x
             return best
-    
+
+        # convenience for the info dict
+        def _finish(p, phase, optimal):
+            t = p - mu_A
+            info = ward_info(t, True, optimal, len(competitor_nodes),
+                            active(p, rev_balls, index_to_name), phase)
+            info["sparsity"] = sparsity
+            info["lam"] = lam if sparsity else 0.0
+            return A_pts + t, info
+
         # ---------------- Phase 1 ----------------
         p0 = project_K_socp()
         if feasible(p0, convex_ball_in, convex_half, rev_balls):
-            t = p0 - mu_A
-            return A_pts + t, ward_info(t, True, True, len(competitor_nodes),
-                                        active(p0, rev_balls, index_to_name),
-                                        "phase1-convex")
-    
-        # ---------------- Phase 2: which reverse-convex balls are violated ----------------
+            # Phase 1 is exact for both objectives (convex program).
+            return _finish(p0, "phase1-convex", True)
+
+        # ---------------- Phase 2: violated reverse-convex balls ----------------
         def violated_at(p):
             return [rb for rb in rev_balls
                     if np.linalg.norm(p - rb['kappa']) < rb['R'] - 1e-7]
-    
+
         # ---------------- Phase 3: greedy deepest-first repair ----------------
         p = p0.copy()
         seen, cycle = set(), False
@@ -457,13 +524,11 @@ class hiceCounterfactuals:
                 cycle = True
                 break
             p = cand
-    
+
         if not cycle and feasible(p, convex_ball_in, convex_half, rev_balls):
-            t = p - mu_A
-            return A_pts + t, ward_info(t, True, True, len(competitor_nodes),
-                                        active(p, rev_balls, index_to_name),
-                                        "phase3-greedy")
-    
+            # exact for L2 (radial/SDP); heuristic for L1 (SLSQP) -> optimal flag reflects it
+            return _finish(p, "phase3-greedy", not sparsity)
+
         # ---------------- Phase 4: active-set enumeration ----------------
         kmax = min(d, len(rev_balls))
         best_p, best_val = None, np.inf
@@ -473,23 +538,20 @@ class hiceCounterfactuals:
                 spheres = [(rev_balls[i]['kappa'], rev_balls[i]['R']) for i in combo]
                 cand = project_spheres_capK(spheres)
                 if cand is not None and feasible(cand, convex_ball_in, convex_half, rev_balls):
-                    val = float(np.sum((cand - mu_A) ** 2))
+                    val = obj_val(cand)                 # score on the SAME objective (L2 or L1)
                     if val < best_val:
                         best_val, best_p = val, cand
                     found_this_k = True
             if found_this_k and not exhaustive:
-                break        # early-stop: first productive active-set size wins
-    
-        if best_p is None:
-            # Ward is always feasible: guaranteed fallback is landing on mu_B.
-            best_p = mu_B.copy()
-    
-        t = best_p - mu_A
-        return A_pts + t, ward_info(t, True, exhaustive, len(competitor_nodes),
-                                    active(best_p, convex_ball_in, rev_balls, index_to_name),
-                                    "phase4-exhaustive" if exhaustive else "phase4-earlystop")
-    
+                break
 
+        if best_p is None:
+            best_p = mu_B.copy()                        # guaranteed-feasible fallback
+
+        # optimal only if exhaustive AND pure L2 (L1 sphere repair is heuristic)
+        opt = exhaustive and not sparsity
+        phase = ("phase4-exhaustive" if exhaustive else "phase4-earlystop")
+        return _finish(best_p, phase, opt)
 
     def counterfactual_complete_linkage_branch(self, B_leaves, A_leaves,
                                             metric='euclidean', anchor='min',

@@ -42,3 +42,14 @@ def proximity(info, A_orig, A_prime, metric):
                 l1=float(np.abs(t).sum()),
                 linf=float(np.abs(t).max()) if t.size else np.nan,
                 n_feat=int(np.count_nonzero(np.abs(t) > 1e-9)))
+
+
+def sparsity(n_feat, n_total_features):
+    """Fraction of features changed (0-1). NaN if n_feat is NaN/None or there
+    are no features to change against."""
+    if n_feat is None or n_total_features in (None, 0):
+        return np.nan
+    n_feat = float(n_feat)
+    if np.isnan(n_feat):
+        return np.nan
+    return n_feat / n_total_features

@@ -6,10 +6,10 @@ Matches the actual API:
     A_prime, info = cf.findCounterfactual(B_leaves, A_leaves)
     A_prime, info = cf.baseline(B_leaves, A_leaves)
 
-For each (A, B) branch pair it runs BOTH the full method and the baseline and
-records, computed INDEPENDENTLY of what the solver reports:
-  - validity under our domination definition (recomputed from scratch, using
-    the same `_dominates` predicate from utilityFunctions),
+For each (A, B) branch pair it runs the full method, the baseline, and any
+enabled competitor baselines (DiCE, BayCon), and records — computed
+INDEPENDENTLY of what each solver reports:
+  - validity under our domination definition (recomputed from scratch),
   - proximity to the original (L2 / L2^2 / L1 / Linf / #features changed;
     coordinate-count for the Hamming relabeling case),
   - for Ward: which algorithm phase fired (info['phase']) and #active balls,
@@ -18,30 +18,36 @@ records, computed INDEPENDENTLY of what the solver reports:
 Dataset is taken from OpenML by name; column types are auto-detected to pick
 euclidean vs hamming, with guards (Ward requires continuous; mixed -> error).
 
+Resumable runs
+--------------
+The CSV is APPENDED to, and the skip check is PER-METHOD: if some methods for a
+(dataset, linkage) are already in the CSV, only the missing ones are run and
+appended. This lets you add a new competitor (e.g. BayCon) to an existing
+results file without recomputing method/baseline/baseline2/dice. Use the SAME --seed as
+the original run so the (A,B) pairs (and hence pair_idx) line up across methods.
+
 Usage
 -----
-    python run_experiments.py --dataset iris --linkage ward --out results.csv
-    python run_experiments.py --dataset kr-vs-kp --linkage complete --out r.csv
-    python run_experiments.py --linkage ward --synthetic          # offline
+    python runHierarchical.py --dataset iris --linkage ward --out results.csv
+    python runHierarchical.py --dataset iris --linkage ward --out results.csv --no-dice
+    python runHierarchical.py --linkage ward --synthetic          # offline
 """
 
-import argparse, time, csv, sys
+import argparse, time, csv, sys, os
 import numpy as np
 from scipy.cluster.hierarchy import linkage as scipy_linkage
 
-
-from modules.hiceCounterfactuals import hiceCounterfactuals          
-from modules.utilityFunctions import _dominates, detect_column_types, load_synthetic        
-from modules.metrics import proximity, validity
+from modules.hiceCounterfactuals import hiceCounterfactuals
+from modules.utilityFunctions import _dominates, detect_column_types, load_synthetic
+from modules.metrics import proximity, validity, sparsity
 from modules.dice import run_dice_baseline
 from modules.baycon import run_baycon_baseline
+from tqdm import tqdm
+
 
 # ======================================================================
 # Column-type detection + metric resolution
 # ======================================================================
-
-
-
 def resolve_metric_and_validate(df, linkage):
     types = detect_column_types(df)
     kinds = set(types.values())
@@ -60,14 +66,12 @@ def resolve_metric_and_validate(df, linkage):
         "all-categorical -> Hamming). Mixed data would need a heterogeneous "
         f"metric such as Gower's, not implemented. Per-column types: {types}")
 
+
 def load_openml(name, linkage):
     import openml, pandas as pd
     ds = openml.datasets.get_dataset(name)
-    target = ds.default_target_attribute         
-    Xdf, _, _, _ = ds.get_data(
-        dataset_format="dataframe",
-        target=target,                           
-    )
+    target = ds.default_target_attribute
+    Xdf, _, _, _ = ds.get_data(dataset_format="dataframe", target=target)
     Xdf = Xdf.dropna(axis=1, how='any')
     metric, types = resolve_metric_and_validate(Xdf, linkage)
     if metric == 'euclidean':
@@ -79,33 +83,31 @@ def load_openml(name, linkage):
     return X, metric, types
 
 
-
-
-
+# ======================================================================
+# Per-method presence check (for resumable, append-only runs)
+# ======================================================================
+def _methods_in_csv(out_csv, dataset_label, linkage):
+    """
+    Set of `which` (method names) already present for this (dataset, linkage)
+    in the CSV. Empty set if the file/rows don't exist.
+    """
+    present = set()
+    if not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
+        return present
+    with open(out_csv, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('dataset') == dataset_label and row.get('linkage') == linkage:
+                present.add(row.get('which'))
+    return present
 
 
 # ======================================================================
 # Main loop
 # ======================================================================
-def _already_in_csv(out_csv, dataset_label, linkage):
-    import os
-    if not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
-        return False
-    with open(out_csv, newline='') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get('dataset') == dataset_label and row.get('linkage') == linkage:
-                return True
-    return False
-
-
 def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
         synthetic=False, seed=0, eps=0.0, run_dice=True, run_baycon=True):
     dataset_label = dataset if not synthetic else 'synthetic'
-    if _already_in_csv(out_csv, dataset_label, linkage):
-        print(f"[skip] '{dataset_label}' (linkage={linkage}) already present in "
-              f"{out_csv}, skipping run.")
-        return []
 
     if synthetic:
         X = load_synthetic(seed=seed); metric, types = 'euclidean', {}
@@ -125,23 +127,35 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
     # one class instance, reused across all pairs
     cf = hiceCounterfactuals(X=X, Z=Z, metric=metric, linkage=linkage, anchor='min')
 
-    # which methods to run: DiCE/BayCon are Ward-only for now (complete seed not implemented)
+    # full set of methods we'd run for this config
     which_list = ['method', 'baseline']
+    if linkage == 'ward':
+        which_list.append('baseline2')
     if run_dice and linkage == 'ward' and metric == 'euclidean':
         which_list.append('dice')
     if run_baycon and linkage == 'ward' and metric == 'euclidean':
         which_list.append('baycon')
 
+    # per-method skip: only run methods NOT already present for this config
+    already = _methods_in_csv(out_csv, dataset_label, linkage)
+    to_run = [w for w in which_list if w not in already]
+    if not to_run:
+        print(f"[skip] all methods {which_list} already present for "
+              f"'{dataset_label}'/{linkage} in {out_csv}; nothing to do.")
+        return []
+    if already:
+        print(f"[resume] already present: {sorted(already)}; running only: {to_run}")
+
     pairs = cf.enumerate_pairs(min_leaf, max_leaf, max_pairs, seed=seed)
-    print(f"[pairs] testing {len(pairs)} (A,B) pairs; methods={which_list}")
+    print(f"[pairs] testing {len(pairs)} (A,B) pairs; methods={to_run}")
 
     rows = []
-    for idx, (A_lv, B_lv) in enumerate(pairs):
+    for idx, (A_lv, B_lv) in enumerate(tqdm(pairs)):
         A_pts = X[sorted(A_lv)]; B_pts = X[sorted(B_lv)]
         comps_leaves, s_A, s_B, s_star = cf.competitor_leaf_sets(A_lv, B_lv)
         comp_pts = [X[sorted(c)] for c in comps_leaves]
 
-        for which in which_list:
+        for which in to_run:
             err = ''; A_prime = None; info = {}; secs = np.nan
             try:
                 t0 = time.perf_counter()
@@ -149,6 +163,8 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
                     A_prime, info = cf.findCounterfactual(B_leaves=B_lv, A_leaves=A_lv)
                 elif which == 'baseline':
                     A_prime, info = cf.baseline(B_leaves=B_lv, A_leaves=A_lv)
+                elif which == 'baseline2':
+                    A_prime, info = cf.baseline2(B_leaves=B_lv, A_leaves=A_lv)
                 elif which == 'dice':
                     A_prime, info = run_dice_baseline(
                         A_pts, B_pts, comp_pts, linkage, X_all=X,
@@ -161,27 +177,9 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
 
-            
             valid = validity(A_prime, B_pts, comp_pts, linkage, metric, eps=eps)
-
-            '''
-            solver_says = (bool(info.get('feasible', False))
-                                       and info.get('optimal', False)) if isinstance(info, dict) else False
-            # diagnostic: solver certified optimal but harness says invalid -> mismatch
-            if which == 'method' and solver_says and not valid and A_prime is not None:
-                from scipy.spatial.distance import cdist
-                nA = len(A_prime); muA = A_prime.mean(0)
-                def wd(P):
-                    nS = len(P); c = (2 * nA * nS / (nA + nS)) ** 0.5
-                    return c * np.linalg.norm(muA - P.mean(0))
-                dB = wd(B_pts)
-                offenders = [(sorted(c), wd(Xc)) for c, Xc in zip(comps_leaves, comp_pts)
-                             if not (dB < wd(Xc) - eps)]
-                print(f"[MISMATCH pair {idx}] n_comp harness={len(comps_leaves)} "
-                      f"solver={info.get('n_competitors')} dB={dB:.6f} "
-                      f"closest_offender={min(offenders, key=lambda o: o[1]) if offenders else None}")
-            '''
             prox = proximity(info if isinstance(info, dict) else {}, A_pts, A_prime, metric)
+            spars = sparsity(prox['n_feat'], X.shape[1])
 
             rows.append(dict(
                 dataset=dataset_label,
@@ -192,6 +190,7 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
                 valid=int(valid),
                 l2=prox['l2'], l2_sq=prox['l2_sq'], l1=prox['l1'],
                 linf=prox['linf'], n_features_changed=prox['n_feat'],
+                sparsity=spars,
                 solver_feasible=int(bool(info.get('feasible', False))) if isinstance(info, dict) else 0,
                 solver_optimal=int(bool(info.get('optimal', False))) if isinstance(info, dict) else 0,
                 ward_phase=info.get('phase', '') if isinstance(info, dict) else '',
@@ -204,15 +203,52 @@ def run(dataset, linkage, out_csv, min_leaf, max_leaf, max_pairs,
         if (idx + 1) % 25 == 0:
             print(f"  ... {idx+1}/{len(pairs)}")
 
+    # ---- append to CSV (header only if the file is new/empty) ----
     if rows:
-        import os
         file_exists = os.path.exists(out_csv) and os.path.getsize(out_csv) > 0
-        with open(out_csv, 'a', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            if not file_exists:
+        # if appending to an existing file, align to its header to stay consistent
+        fieldnames = list(rows[0].keys())
+        existing_header = None
+        existing_rows = None
+        if file_exists:
+            with open(out_csv, newline='') as f:
+                reader = csv.DictReader(f)
+                existing_header = reader.fieldnames
+                if existing_header and any(k not in existing_header for k in fieldnames):
+                    # new columns introduced: need to rewrite the whole file
+                    # with a widened header, so the existing rows stay aligned
+                    existing_rows = list(reader)
+            if existing_header:
+                # union: keep existing columns, add any new ones at the end
+                for k in fieldnames:
+                    if k not in existing_header:
+                        existing_header.append(k)
+                fieldnames = existing_header
+
+        if existing_rows is not None:
+            # header widened -> rewrite the file from scratch
+            with open(out_csv, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 w.writeheader()
-            w.writerows(rows)
+                for r in existing_rows:
+                    for k in fieldnames:
+                        r.setdefault(k, '')
+                    w.writerow(r)
+                for r in rows:
+                    for k in fieldnames:
+                        r.setdefault(k, '')
+                    w.writerow(r)
+        else:
+            with open(out_csv, 'a', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                if not file_exists:
+                    w.writeheader()
+                for r in rows:
+                    for k in fieldnames:
+                        r.setdefault(k, '')
+                    w.writerow(r)
         print(f"[out] appended {len(rows)} rows to {out_csv}")
+
     _summary(rows, linkage)
     return rows
 
@@ -230,12 +266,17 @@ def _summary(rows, linkage):
         vr = [r for r in sub if r['valid']]
         l2 = np.nanmean([r['l2'] for r in vr]) if vr else np.nan
         nf = np.nanmean([r['n_features_changed'] for r in vr]) if vr else np.nan
-        print(f"\n[{which}] valid={vrate:.1%}  mean L2(valid)={l2:.4f}  "
-              f"mean #feat(valid)={nf:.2f}  n={len(sub)}")
+        line = (f"\n[{which}] valid={vrate:.1%}  mean L2(valid)={l2:.4f}  "
+                f"mean #feat(valid)={nf:.2f}  n={len(sub)}")
+        if which in ('dice', 'baycon'):
+            own = 1.0 - np.mean([int(r.get('used_fallback', 0) or 0) for r in sub])
+            line += f"  found-own-CF={own:.1%}"
+        print(line)
         if linkage == 'ward' and which == 'method':
             print(f"    phase activation: {dict(Counter(r['ward_phase'] for r in sub))}")
             print(f"    #active balls:    {dict(Counter(r['n_active_balls'] for r in sub))}")
-    agg('method'); agg('baseline')
+    for w in ('method', 'baseline', 'baseline2', 'dice', 'baycon'):
+        agg(w)
 
 
 def main():
@@ -249,9 +290,12 @@ def main():
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--eps', type=float, default=0.0)
     ap.add_argument('--synthetic', action='store_true')
+    ap.add_argument('--no-dice', action='store_true', help="disable the DiCE baseline")
+    ap.add_argument('--no-baycon', action='store_true', help="disable the BayCon baseline")
     a = ap.parse_args()
     run(a.dataset, a.linkage, a.out, a.min_leaf, a.max_leaf, a.max_pairs,
-        synthetic=a.synthetic, seed=a.seed, eps=a.eps)
+        synthetic=a.synthetic, seed=a.seed, eps=a.eps,
+        run_dice=not a.no_dice, run_baycon=not a.no_baycon)
 
 
 if __name__ == '__main__':
