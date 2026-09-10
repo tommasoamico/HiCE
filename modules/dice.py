@@ -77,25 +77,61 @@ class ConstraintClassifier:
         self.d = self.A.shape[1]
         self.classes_ = np.array([0, 1])          # sklearn-compat attribute
 
+        # ---- precomputed centroids/constants for the vectorized Ward path ----
+        # Ward distance only depends on cluster centroids and sizes, and a rigid
+        # translation shifts the centroid by exactly t (mean(A + t) = mean(A) + t),
+        # so the whole margin becomes centroid arithmetic -- no need to touch the
+        # raw points (or call cdist) per candidate t.
+        self.mu_A = self.A.mean(axis=0)
+        self.n_A = len(self.A)
+        if self.linkage == 'ward':
+            self.mu_B = self.B.mean(axis=0)
+            n_B = len(self.B)
+            self.c_AB = np.sqrt(2.0 * self.n_A * n_B / (self.n_A + n_B))
+            if self.comp:
+                self.mu_comp = np.stack([c.mean(axis=0) for c in self.comp])   # (k, d)
+                n_comp = np.array([len(c) for c in self.comp], dtype=float)    # (k,)
+                self.c_comp = np.sqrt(2.0 * self.n_A * n_comp / (self.n_A + n_comp))
+            else:
+                self.mu_comp = None
+                self.c_comp = None
+
     def _margin(self, t):
+        """Single-t margin, exact (used as the complete-linkage fallback)."""
         Ap = self.A + t
         dB = distLinkage(Ap, self.B, self.linkage)
         if not self.comp:
             return 1.0                            # no competitors -> trivially valid
         return min(distLinkage(Ap, X, self.linkage) - dB for X in self.comp)
 
+    def _margin_batch(self, T):
+        """
+        Vectorized margin for a batch of candidate translations T, (m, d).
+        Ward only: reduces to centroid distances, precomputed in __init__.
+        """
+        muAp = self.mu_A[None, :] + T                                   # (m, d)
+        dB = self.c_AB * np.linalg.norm(muAp - self.mu_B[None, :], axis=1)  # (m,)
+        if self.mu_comp is None:
+            return np.full(T.shape[0], np.inf)    # no competitors -> trivially valid
+        diff = muAp[:, None, :] - self.mu_comp[None, :, :]               # (m, k, d)
+        dX = self.c_comp[None, :] * np.linalg.norm(diff, axis=2)         # (m, k)
+        return dX.min(axis=1) - dB                                       # (m,)
+
+    def _margins(self, T):
+        if self.linkage == 'ward':
+            return self._margin_batch(T)
+        return np.array([self._margin(t) for t in T])
+
     def predict(self, T):
         T = np.atleast_2d(np.asarray(T, float))
-        return np.array([1 if self._margin(t) > self.eps else 0 for t in T], dtype=int)
+        m = self._margins(T)
+        return (m > self.eps).astype(int)
 
     def predict_proba(self, T):
         T = np.atleast_2d(np.asarray(T, float))
-        out = []
-        for t in T:
-            m = self._margin(t)
-            p1 = 1.0 / (1.0 + np.exp(-self.scale * m))
-            out.append([1.0 - p1, p1])
-        return np.array(out)
+        m = self._margins(T)
+        p1 = 1.0 / (1.0 + np.exp(-self.scale * m))
+        return np.column_stack([1.0 - p1, p1])
 
 
 # ======================================================================
