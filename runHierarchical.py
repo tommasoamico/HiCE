@@ -417,10 +417,17 @@ def main():
 
     for dataset in a.dataset:
         print(f"\n===== dataset: {dataset} =====")
-        run(dataset, a.linkage, a.out, a.min_leaf, a.max_leaf, a.max_pairs,
-            synthetic=False, seed=a.seed, eps=a.eps,
-            run_hice=not a.no_hice, run_dice=not a.no_dice, run_baycon=not a.no_baycon,
-            timeout=timeout)
+        try:
+            run(dataset, a.linkage, a.out, a.min_leaf, a.max_leaf, a.max_pairs,
+                synthetic=False, seed=a.seed, eps=a.eps,
+                run_hice=not a.no_hice, run_dice=not a.no_dice, run_baycon=not a.no_baycon,
+                timeout=timeout)
+        except ValueError as e:
+            # e.g. Ward linkage requested on an all-categorical dataset, or
+            # mixed-type columns: this dataset is incompatible with the
+            # requested config, not a bug -- skip it and keep going.
+            print(f"[skip] '{dataset}': {e}")
+            continue
 
 
 if __name__ == '__main__':
