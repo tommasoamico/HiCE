@@ -40,176 +40,20 @@ turn and appended to the SAME --out file (resumable per-(dataset, method) as
 usual).
 """
 
-import argparse, time, csv, sys, os, random, hashlib, signal
+import argparse, time, csv, sys, os, signal
 from contextlib import contextmanager
 import numpy as np
 from scipy.cluster.hierarchy import linkage as scipy_linkage
-
+from modules.constants import FIELDNAMES
 from modules.hiceCounterfactuals import hiceCounterfactuals
-from modules.utilityFunctions import _dominates, detect_column_types, load_synthetic
+from modules.utilityFunctions import MethodTimeout, _prepare_out_csv, _methods_in_csv, time_limit, call_seed, _seed_everything, load_openml, _dominates, detect_column_types, load_synthetic
 from modules.metrics import proximity, validity, sparsity
 from modules.dice import run_dice_baseline
 from modules.baycon import run_baycon_baseline
 from tqdm import tqdm
 
 
-# ======================================================================
-# Column-type detection + metric resolution
-# ======================================================================
-def resolve_metric_and_validate(df, linkage):
-    types = detect_column_types(df)
-    kinds = set(types.values())
-    if kinds == {'continuous'}:
-        return 'euclidean', types
-    if kinds == {'categorical'}:
-        if linkage == 'ward':
-            raise ValueError(
-                "Ward linkage requires continuous (Euclidean) features, but all "
-                "columns were detected as categorical. Use linkage='complete' "
-                "for categorical data.")
-        return 'hamming', types
-    raise ValueError(
-        f"Mixed-type data is not supported (detected kinds {kinds}). The method "
-        "requires a single ground metric (all-continuous -> Euclidean, or "
-        "all-categorical -> Hamming). Mixed data would need a heterogeneous "
-        f"metric such as Gower's, not implemented. Per-column types: {types}")
 
-
-def load_openml(name, linkage):
-    import openml, pandas as pd
-    ds = openml.datasets.get_dataset(name)
-    target = ds.default_target_attribute
-    Xdf, _, _, _ = ds.get_data(dataset_format="dataframe", target=target)
-    Xdf = Xdf.dropna(axis=1, how='any')
-    metric, types = resolve_metric_and_validate(Xdf, linkage)
-    if metric == 'euclidean':
-        X = Xdf.to_numpy(dtype=float)
-        X = (X - X.mean(0)) / (X.std(0) + 1e-12)
-    else:
-        X = np.column_stack([pd.Categorical(Xdf[c]).codes.astype(int)
-                             for c in Xdf.columns]).astype(int)
-    return X, metric, types
-
-
-# ======================================================================
-# Reproducibility helpers
-# ======================================================================
-def _seed_everything(seed):
-    """Seed every global RNG a competitor baseline might reach for (both
-    baycon and DiCE-genetic draw from the GLOBAL numpy/python random state,
-    not a local Generator), so a call is reproducible on its own."""
-    random.seed(seed)
-    np.random.seed(seed)
-
-
-def call_seed(dataset_label, linkage, base_seed, pair_idx, which):
-    """
-    Deterministic per-(dataset, linkage, base_seed, pair_idx, which) seed in
-    [0, 2**32). Depends ONLY on these five values (not on run order, other
-    methods, or anything upstream), so re-deriving it later reproduces the
-    exact seed used originally -- e.g. to replay just the BayCon run for one
-    pair in isolation: recompute the pair with the same (dataset, linkage,
-    base_seed, min_leaf, max_leaf, max_pairs) via enumerate_pairs, take
-    pair_idx, then call `_seed_everything(call_seed(...))` followed by
-    `run_baycon_baseline(..., seed=call_seed(...))`.
-    """
-    key = f"{dataset_label}|{linkage}|{base_seed}|{pair_idx}|{which}"
-    digest = hashlib.sha256(key.encode()).hexdigest()
-    return int(digest[:8], 16)
-
-
-# ======================================================================
-# Per-call wall-clock timeout
-# ======================================================================
-class MethodTimeout(Exception):
-    pass
-
-
-@contextmanager
-def time_limit(seconds):
-    """
-    Abort whatever runs inside the block if it's still running after
-    `seconds`, raising MethodTimeout. Uses a real-time SIGALRM, so it only
-    fires on the main thread and only on POSIX (no-op elsewhere) -- fine
-    here since the slow offenders (DiCE genetic search, BayCon) are pure
-    Python/numpy and periodically release control, so the signal reliably
-    lands inside the search loop rather than waiting for a syscall boundary.
-    """
-    if not hasattr(signal, 'SIGALRM') or seconds is None:
-        yield
-        return
-
-    def _handler(signum, frame):
-        raise MethodTimeout(f"exceeded {seconds}s wall-clock limit")
-
-    old_handler = signal.signal(signal.SIGALRM, _handler)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old_handler)
-
-
-# ======================================================================
-# Per-method presence check (for resumable, append-only runs)
-# ======================================================================
-FIELDNAMES = [
-    'dataset', 'linkage', 'metric', 'pair_idx', 'which', 'base_seed', 'call_seed',
-    'n_A', 'n_B', 'n_competitors', 's_A', 's_B', 's_star', 'valid',
-    'l2', 'l2_sq', 'l1', 'linf', 'n_features_changed', 'sparsity',
-    'solver_feasible', 'solver_optimal', 'ward_phase', 'n_active_balls',
-    'used_fallback', 'seconds', 'aborted_timeout', 'error',
-]
-
-
-def _prepare_out_csv(out_csv, fieldnames):
-    """
-    Ensure `out_csv` exists with a header covering `fieldnames`, widening it
-    (and rewriting existing rows) if the file already has a narrower header
-    from an older run. Returns the fieldnames to use for every row appended
-    from here on. Called once before the pairs loop so rows can be appended
-    one at a time as they're found, instead of batching until the run ends.
-    """
-    file_exists = os.path.exists(out_csv) and os.path.getsize(out_csv) > 0
-    if not file_exists:
-        with open(out_csv, 'w', newline='') as f:
-            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
-        return fieldnames
-
-    with open(out_csv, newline='') as f:
-        reader = csv.DictReader(f)
-        existing_header = reader.fieldnames or []
-        missing = [k for k in fieldnames if k not in existing_header]
-        if not missing:
-            return existing_header
-        existing_rows = list(reader)
-
-    widened = existing_header + missing
-    with open(out_csv, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=widened, extrasaction='ignore')
-        w.writeheader()
-        for r in existing_rows:
-            for k in widened:
-                r.setdefault(k, '')
-            w.writerow(r)
-    return widened
-
-
-def _methods_in_csv(out_csv, dataset_label, linkage):
-    """
-    Set of `which` (method names) already present for this (dataset, linkage)
-    in the CSV. Empty set if the file/rows don't exist.
-    """
-    present = set()
-    if not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
-        return present
-    with open(out_csv, newline='') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get('dataset') == dataset_label and row.get('linkage') == linkage:
-                present.add(row.get('which'))
-    return present
 
 
 # ======================================================================

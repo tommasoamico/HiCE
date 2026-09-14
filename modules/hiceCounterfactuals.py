@@ -282,18 +282,27 @@ class hiceCounterfactuals:
     def counterfactual_ward_branch(self, B_leaves, A_leaves,
                                anchor='min', eps=1e-6, index_to_name=None,
                                exhaustive=False, socp_solver=None,
-                               sparsity=True, lam=1.0, verbose=False):
+                               sparsity=True, lam=1.0, verbose=False,
+                               allowed_features=None):
         """
         Ward-linkage counterfactual: rigidly translate branch A by t so A becomes
         Ward-closer to target branch B than to every live competitor.
 
         Objective
         ---------
-        sparsity=False (default): minimize ||t||^2  (least Euclidean displacement).
-        sparsity=True            : minimize ||t||^2 + lam * ||t||_1  (elastic net),
-                                which drives coordinates of t to exact zero,
-                                yielding a FEATURE-SPARSE counterfactual. lam is
-                                the sparsity weight; lam=0 recovers the L2 case.
+        sparsity=False      : minimize ||t||^2  (least Euclidean displacement).
+        sparsity=True       : minimize ||t||^2 + lam * ||t||_1  (elastic net),
+                            which drives coordinates of t to exact zero,
+                            yielding a FEATURE-SPARSE counterfactual. lam is
+                            the sparsity weight (passed in); lam=0 recovers
+                            the L2 case.
+        sparsity='adaptive' : same elastic-net objective, but lam is derived
+                            from the data instead of passed in:
+                                t_star = mu_B - mu_A
+                                lam = ||t_star||^2 / ||t_star||  (= ||t_star||)
+                            i.e. lam scales with the distance between the
+                            origin and target cluster centroids; the `lam`
+                            argument is ignored in this mode.
 
         Geometry (objective-independent)
         --------------------------------
@@ -323,10 +332,29 @@ class hiceCounterfactuals:
 
         Parameters
         ----------
-        sparsity : bool     use the L2^2 + lam*L1 elastic-net objective.
-        lam : float         L1 weight (only used when sparsity=True).
+        sparsity : bool or 'adaptive'
+                            False: pure L2. True: L2^2 + lam*L1 with lam as given.
+                            'adaptive': L2^2 + lam*L1 with lam = ||mu_B-mu_A||^2/||mu_B-mu_A||.
+        lam : float         L1 weight (used when sparsity=True; ignored/overridden
+                            when sparsity='adaptive').
         exhaustive : bool   Phase-4 behaviour (see below).
         socp_solver : cvxpy solver constant, optional (default CLARABEL, else ECOS).
+        allowed_features : array-like of {0,1}, length d, optional
+                            Hard sparsity mask: allowed_features[i]==0 forces
+                            t[i]==0 (feature i may not move); ==1 leaves it
+                            free. When given, the whole problem is solved in
+                            the lower-dimensional subspace spanned by the free
+                            coordinates only (t restricted to R^k, k = number
+                            of 1s), and sparsity/lam are overridden to False/0
+                            since the L1 penalty is no longer needed to induce
+                            sparsity — the mask already fixes it exactly.
+                            Feature restriction only adds LINEAR equalities
+                            (p_fixed = mu_A_fixed) on top of the still-purely-
+                            quadratic L2 objective, so the exact single-sphere
+                            fast paths (radial closed form / S-lemma SDP) for
+                            the reverse-convex repair remain exact and are
+                            NOT disabled by this mask (unlike sparsity=True,
+                            whose L1 term does break them).
 
         Returns
         -------
@@ -353,6 +381,33 @@ class hiceCounterfactuals:
             return 2.0 * n_A * nS / (n_A + nS)
         w_B = w(n_B)
 
+        # ---- feature mask: restrict t to the subspace of allowed features ----
+        free_idx = np.arange(d)
+        fixed_idx = np.array([], dtype=int)
+        if allowed_features is not None:
+            mask = np.asarray(allowed_features).astype(bool).reshape(-1)
+            if mask.shape[0] != d:
+                raise ValueError(f"allowed_features must have length d={d}, got {mask.shape[0]}.")
+            if not mask.any():
+                raise ValueError("allowed_features must allow at least one feature to change.")
+            free_idx = np.where(mask)[0]
+            fixed_idx = np.where(~mask)[0]
+            if sparsity:
+                if verbose:
+                    print("allowed_features given: overriding sparsity=False, lam=0.0 "
+                          "(the mask already induces exact sparsity).")
+                sparsity = False
+            lam = 0.0
+
+        # ---- sparsity mode: False (no L1), True (fixed lam), 'adaptive' (data-driven lam) ----
+        if sparsity not in (False, True, 'adaptive'):
+            raise ValueError("sparsity must be False, True, or 'adaptive'.")
+        if sparsity == 'adaptive':
+            t_star = mu_B - mu_A
+            norm_t_star = float(np.linalg.norm(t_star))
+            lam = (norm_t_star ** 2) / norm_t_star if norm_t_star > 1e-12 else 0.0
+        use_sparsity = bool(sparsity)
+
         # ---- Step 1: anchor + live partition ----
         if anchor != 'min':
             raise NotImplementedError("Only anchor='min' (s* = min(s_A, s_B)) is implemented.")
@@ -371,6 +426,7 @@ class hiceCounterfactuals:
         if not competitor_nodes:
             info = ward_info(np.zeros(d), True, True, 0, [], "guard-no-competitors")
             info["sparsity"] = sparsity; info["lam"] = lam if sparsity else 0.0
+            info["allowed_features"] = None if allowed_features is None else np.asarray(allowed_features).tolist()
             return A_pts.copy(), info
 
         # ---- Apollonius data (objective-independent) ----
@@ -397,30 +453,38 @@ class hiceCounterfactuals:
         if socp_solver is None:
             socp_solver = cp.CLARABEL if hasattr(cp, "CLARABEL") else cp.ECOS
 
+        # ---- feature-subspace embedding: p = mu_A + E @ t_free, t_free in R^k ----
+        # k = len(free_idx) <= d. E is the d x k matrix scattering the free
+        # coordinates back into the full space (identity columns at free_idx,
+        # zero elsewhere), so t = E @ t_free is automatically zero on fixed_idx.
+        k_free = len(free_idx)
+        E = np.eye(d)[:, free_idx]
+
         # ---- objective helper (numeric, for scoring / SLSQP) ----
         def obj_val(p):
             t = p - mu_A
             v = float(t @ t)
-            if sparsity:
+            if use_sparsity:
                 v += lam * float(np.sum(np.abs(t)))
             return v
 
         # ---- convex projection onto K (SOCP; + L1 term if sparsity) ----
         def project_K_socp():
-            p = cp.Variable(d)
+            t_free = cp.Variable(k_free)
+            p = mu_A + E @ t_free
             cons = []
             for (kappa, R) in convex_ball_in:
                 cons.append(cp.norm(p - kappa) <= R)
             for (a, b) in convex_half:
                 cons.append(a @ p <= b)
-            objective = cp.sum_squares(p - mu_A)
-            if sparsity:
-                objective = objective + lam * cp.norm1(p - mu_A)   # elastic net
+            objective = cp.sum_squares(t_free)
+            if use_sparsity:
+                objective = objective + lam * cp.norm1(t_free)   # elastic net
             prob = cp.Problem(cp.Minimize(objective), cons)
             prob.solve(solver=socp_solver)
-            if p.value is None:
+            if t_free.value is None:
                 return mu_A.copy()
-            return np.asarray(p.value, dtype=float)
+            return mu_A + E @ np.asarray(t_free.value, dtype=float)
 
         # ---- sphere ∩ K projection ----
         def project_spheres_capK(active_spheres, n_restarts=8):
@@ -431,60 +495,76 @@ class hiceCounterfactuals:
             L1 objective (sparsity=True): the radial foot and the S-lemma SDP are
             NOT valid (radial is L2-only; the Shor SDP is not tight with an L1
             term), so we go straight to multistart SLSQP on L2^2+lam*L1.
+            Feature restriction (allowed_features), by contrast, only adds
+            LINEAR equalities (p_fixed = mu_A_fixed) on top of the same purely
+            quadratic objective, so both fast paths stay exact: the radial
+            foot is taken on sphere ∩ {p_fixed = mu_A_fixed} (itself a sphere
+            in the free coordinates), and the fixed rows are added to the SDP
+            as ordinary linear constraints (S-lemma tightness only needs one
+            quadratic constraint plus arbitrary linear ones).
             Multiple spheres: multistart SLSQP either way.
             """
-            # ---- single sphere, pure L2: exact fast paths ----
-            if len(active_spheres) == 1 and not sparsity:
+            # ---- single sphere, pure L2: exact fast paths (restriction-aware) ----
+            if len(active_spheres) == 1 and not use_sparsity:
                 kappa, R = active_spheres[0]
-                p_cf = project_sphere_closed_form(mu_A, kappa, R)
-                if feasible(p_cf, convex_ball_in, convex_half, rev_balls):
+                p_cf = project_sphere_closed_form(mu_A, kappa, R, fixed_idx=fixed_idx)
+                if p_cf is not None and feasible(p_cf, convex_ball_in, convex_half, rev_balls):
                     return p_cf
-                p_sdp = project_single_sphere_sdp(mu_A, kappa, R, convex_ball_in, convex_half)
+                p_sdp = project_single_sphere_sdp(mu_A, kappa, R, convex_ball_in, convex_half,
+                                                   fixed_idx=fixed_idx)
                 if p_sdp is not None and feasible(p_sdp, convex_ball_in, convex_half, rev_balls):
                     return p_sdp
                 # fall through to SLSQP
 
-            # ---- SLSQP on the (possibly L1) objective ----
+            # ---- SLSQP on the (possibly L1) objective, over t_free in R^k ----
+            # p(t_free) = mu_A + E @ t_free stays exactly on the allowed
+            # subspace by construction, so no extra equality constraint on
+            # the fixed coordinates is needed.
+            def to_p(t_free):
+                return mu_A + E @ t_free
+
             eq_cons = [{'type': 'eq',
-                        'fun': (lambda p, k=k, R=R: np.linalg.norm(p - k) - R)}
+                        'fun': (lambda t_free, k=k, R=R: np.linalg.norm(to_p(t_free) - k) - R)}
                     for (k, R) in active_spheres]
             ineq_cons = []
             for (kappa, R) in convex_ball_in:
                 ineq_cons.append({'type': 'ineq',
-                                'fun': (lambda p, k=kappa, R=R: R - np.linalg.norm(p - k))})
+                                'fun': (lambda t_free, k=kappa, R=R: R - np.linalg.norm(to_p(t_free) - k))})
             for (a, b) in convex_half:
                 ineq_cons.append({'type': 'ineq',
-                                'fun': (lambda p, a=a, b=b: b - a @ p)})
+                                'fun': (lambda t_free, a=a, b=b: b - a @ to_p(t_free))})
             cons = eq_cons + ineq_cons
 
             rng = np.random.default_rng(0)
             starts = []
             k0, R0 = active_spheres[0]
-            dirc = mu_A - k0
+            dirc_full = mu_A - k0
+            dirc = E.T @ dirc_full
             nrm = np.linalg.norm(dirc)
-            starts.append(k0 + R0 * (dirc / nrm if nrm > 1e-12 else unit(d, rng)))
+            starts.append((E.T @ k0) + R0 * (dirc / nrm if nrm > 1e-12 else unit(k_free, rng)))
             for _ in range(n_restarts - 1):
-                starts.append(k0 + R0 * unit(d, rng))
+                starts.append((E.T @ k0) + R0 * unit(k_free, rng))
 
-            # objective + gradient; L1 uses a smooth-ish subgradient (sign), which
-            # SLSQP tolerates in practice with multistart.
-            def fobj(p):
-                return obj_val(p)
-            def fjac(p):
-                t = p - mu_A
+            # objective + gradient (in t_free space); L1 uses a smooth-ish
+            # subgradient (sign), which SLSQP tolerates in practice with
+            # multistart.
+            def fobj(t_free):
+                return obj_val(to_p(t_free))
+            def fjac(t_free):
+                t = E @ t_free
                 g = 2.0 * t
-                if sparsity:
+                if use_sparsity:
                     g = g + lam * np.sign(t)
-                return g
+                return E.T @ g
 
             best, best_val = None, np.inf
             for s in starts:
                 res = minimize(fobj, s, method='SLSQP', jac=fjac,
                             constraints=cons, options={'maxiter': 400, 'ftol': 1e-12})
-                if res.success and feasible(res.x, convex_ball_in, convex_half, rev_balls):
-                    val = obj_val(res.x)
+                if res.success and feasible(to_p(res.x), convex_ball_in, convex_half, rev_balls):
+                    val = obj_val(to_p(res.x))
                     if val < best_val:
-                        best_val, best = val, res.x
+                        best_val, best = val, to_p(res.x)
             return best
 
         # convenience for the info dict
@@ -494,6 +574,7 @@ class hiceCounterfactuals:
                             active(p, rev_balls, index_to_name), phase)
             info["sparsity"] = sparsity
             info["lam"] = lam if sparsity else 0.0
+            info["allowed_features"] = None if allowed_features is None else np.asarray(allowed_features).tolist()
             return A_pts + t, info
 
         # ---------------- Phase 1 ----------------
@@ -526,8 +607,9 @@ class hiceCounterfactuals:
             p = cand
 
         if not cycle and feasible(p, convex_ball_in, convex_half, rev_balls):
-            # exact for L2 (radial/SDP); heuristic for L1 (SLSQP) -> optimal flag reflects it
-            return _finish(p, "phase3-greedy", not sparsity)
+            # exact for L2 (radial/SDP, restriction-aware); heuristic for L1
+            # (SLSQP) -> optimal flag reflects it
+            return _finish(p, "phase3-greedy", not use_sparsity)
 
         # ---------------- Phase 4: active-set enumeration ----------------
         kmax = min(d, len(rev_balls))
@@ -549,7 +631,7 @@ class hiceCounterfactuals:
             best_p = mu_B.copy()                        # guaranteed-feasible fallback
 
         # optimal only if exhaustive AND pure L2 (L1 sphere repair is heuristic)
-        opt = exhaustive and not sparsity
+        opt = exhaustive and not use_sparsity
         phase = ("phase4-exhaustive" if exhaustive else "phase4-earlystop")
         return _finish(best_p, phase, opt)
 

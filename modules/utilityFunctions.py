@@ -1,4 +1,8 @@
 from itertools import product
+from contextlib import contextmanager
+import csv
+import os
+import signal
 
 import numpy as np
 from scipy.cluster.hierarchy import fcluster
@@ -10,6 +14,8 @@ from gurobipy import GRB
 import miniball
 from scipy.optimize import minimize
 import cvxpy as cp
+import hashlib
+import random
 
 
 def load_synthetic(n=60, d=4, k=4, seed=0):
@@ -405,27 +411,67 @@ def greedy_sparsify(A_orig, t, B_pts, competitor_pts_list, linkage,
     return t, info
 
 
-def project_sphere_closed_form(mu_A, kappa, R):
+def project_sphere_closed_form(mu_A, kappa, R, fixed_idx=None):
     """
     Nearest point on the sphere {||p - kappa|| = R} to mu_A, in closed form:
         p* = kappa + R (mu_A - kappa) / ||mu_A - kappa||.
     Exact, O(d). Degenerate mu_A == kappa: any surface point is optimal; return
     kappa + R e_0.
+
+    fixed_idx : array-like of int, optional
+        Indices pinned to p[j] = mu_A[j] (a feature-restriction mask). This
+        adds the affine constraint p_fixed = mu_A_fixed on top of the sphere,
+        i.e. we project onto sphere ∩ {p_fixed = mu_A_fixed}. Since p_fixed is
+        pinned, that intersection is itself a lower-dimensional sphere in the
+        free coordinates, centered at kappa_free with the (possibly smaller)
+        radius R' = sqrt(R^2 - ||mu_A_fixed - kappa_fixed||^2) — so the same
+        radial closed form applies restricted to the free coordinates. Returns
+        None if R' is not real (the affine slice misses the sphere).
     """
-    g = mu_A - kappa
-    nrm = np.linalg.norm(g)
+    if fixed_idx is None or len(fixed_idx) == 0:
+        g = mu_A - kappa
+        nrm = np.linalg.norm(g)
+        if nrm < 1e-12:
+            u = np.zeros_like(mu_A, dtype=float); u[0] = 1.0
+        else:
+            u = g / nrm
+        return kappa + R * u
+
+    fixed_idx = np.asarray(fixed_idx, dtype=int)
+    free_mask = np.ones(len(mu_A), dtype=bool)
+    free_mask[fixed_idx] = False
+
+    fixed_gap_sq = float(np.sum((mu_A[fixed_idx] - kappa[fixed_idx]) ** 2))
+    R_free_sq = R ** 2 - fixed_gap_sq
+    if R_free_sq < -1e-9:
+        return None
+    R_free = np.sqrt(max(R_free_sq, 0.0))
+
+    p = mu_A.copy()   # p[fixed_idx] stays mu_A[fixed_idx], the affine pin
+
+    g_free = mu_A[free_mask] - kappa[free_mask]
+    nrm = np.linalg.norm(g_free)
     if nrm < 1e-12:
-        u = np.zeros_like(mu_A, dtype=float); u[0] = 1.0
+        u_free = np.zeros_like(g_free);
+        if u_free.size:
+            u_free[0] = 1.0
     else:
-        u = g / nrm
-    return kappa + R * u
- 
+        u_free = g_free / nrm
+    p[free_mask] = kappa[free_mask] + R_free * u_free
+    return p
+
 
 def project_single_sphere_sdp(mu_A, kappa, R, convex_ball_in, convex_half,
-                              solver=None):
+                              solver=None, fixed_idx=None):
     """
     Exact projection of mu_A onto {||p - kappa|| = R} ∩ K via the Shor SDP,
     tight for a single quadratic equality. Returns p or None.
+
+    fixed_idx : array-like of int, optional
+        Indices pinned to p[j] = mu_A[j] (a feature-restriction mask). These
+        are ordinary linear equalities, added alongside K's linear/SOC faces;
+        the S-lemma tightness only requires ONE quadratic constraint (the
+        sphere) plus arbitrary linear ones, so it still applies unchanged.
     """
     d = len(mu_A)
     if solver is None:
@@ -440,6 +486,9 @@ def project_single_sphere_sdp(mu_A, kappa, R, convex_ball_in, convex_half,
         cons.append(cp.norm(p - kc) <= Rc)
     for (a, b) in convex_half:
         cons.append(a @ p <= b)
+    if fixed_idx is not None and len(fixed_idx) > 0:
+        fixed_idx = np.asarray(fixed_idx, dtype=int)
+        cons.append(p[fixed_idx] == mu_A[fixed_idx])
     obj = cp.Minimize(cp.trace(P) - 2 * mu_A @ p + float(mu_A @ mu_A))
     prob = cp.Problem(obj, cons)
     try:
@@ -447,4 +496,155 @@ def project_single_sphere_sdp(mu_A, kappa, R, convex_ball_in, convex_half,
     except Exception:
         return None
     return None if p.value is None else np.asarray(p.value, dtype=float)
- 
+
+# ======================================================================
+# Column-type detection + metric resolution
+# ======================================================================
+
+
+def resolve_metric_and_validate(df, linkage):
+    types = detect_column_types(df)
+    kinds = set(types.values())
+    if kinds == {'continuous'}:
+        return 'euclidean', types
+    if kinds == {'categorical'}:
+        if linkage == 'ward':
+            raise ValueError(
+                "Ward linkage requires continuous (Euclidean) features, but all "
+                "columns were detected as categorical. Use linkage='complete' "
+                "for categorical data.")
+        return 'hamming', types
+    raise ValueError(
+        f"Mixed-type data is not supported (detected kinds {kinds}). The method "
+        "requires a single ground metric (all-continuous -> Euclidean, or "
+        "all-categorical -> Hamming). Mixed data would need a heterogeneous "
+        f"metric such as Gower's, not implemented. Per-column types: {types}")
+
+
+def load_openml(name, linkage):
+    import openml, pandas as pd
+    ds = openml.datasets.get_dataset(name)
+    target = ds.default_target_attribute
+    Xdf, _, _, _ = ds.get_data(dataset_format="dataframe", target=target)
+    Xdf = Xdf.dropna(axis=1, how='any')
+    metric, types = resolve_metric_and_validate(Xdf, linkage)
+    if metric == 'euclidean':
+        X = Xdf.to_numpy(dtype=float)
+        X = (X - X.mean(0)) / (X.std(0) + 1e-12)
+    else:
+        X = np.column_stack([pd.Categorical(Xdf[c]).codes.astype(int)
+                             for c in Xdf.columns]).astype(int)
+    return X, metric, types
+
+
+
+# ======================================================================
+# Reproducibility helpers
+# ======================================================================
+def _seed_everything(seed):
+    """Seed every global RNG a competitor baseline might reach for (both
+    baycon and DiCE-genetic draw from the GLOBAL numpy/python random state,
+    not a local Generator), so a call is reproducible on its own."""
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def call_seed(dataset_label, linkage, base_seed, pair_idx, which):
+    """
+    Deterministic per-(dataset, linkage, base_seed, pair_idx, which) seed in
+    [0, 2**32). Depends ONLY on these five values (not on run order, other
+    methods, or anything upstream), so re-deriving it later reproduces the
+    exact seed used originally -- e.g. to replay just the BayCon run for one
+    pair in isolation: recompute the pair with the same (dataset, linkage,
+    base_seed, min_leaf, max_leaf, max_pairs) via enumerate_pairs, take
+    pair_idx, then call `_seed_everything(call_seed(...))` followed by
+    `run_baycon_baseline(..., seed=call_seed(...))`.
+    """
+    key = f"{dataset_label}|{linkage}|{base_seed}|{pair_idx}|{which}"
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    return int(digest[:8], 16)
+
+
+# ======================================================================
+# Per-call wall-clock timeout
+# ======================================================================
+class MethodTimeout(Exception):
+    pass
+
+
+@contextmanager
+def time_limit(seconds):
+    """
+    Abort whatever runs inside the block if it's still running after
+    `seconds`, raising MethodTimeout. Uses a real-time SIGALRM, so it only
+    fires on the main thread and only on POSIX (no-op elsewhere) -- fine
+    here since the slow offenders (DiCE genetic search, BayCon) are pure
+    Python/numpy and periodically release control, so the signal reliably
+    lands inside the search loop rather than waiting for a syscall boundary.
+    """
+    if not hasattr(signal, 'SIGALRM') or seconds is None:
+        yield
+        return
+
+    def _handler(signum, frame):
+        raise MethodTimeout(f"exceeded {seconds}s wall-clock limit")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+
+
+
+def _prepare_out_csv(out_csv, fieldnames):
+    """
+    Ensure `out_csv` exists with a header covering `fieldnames`, widening it
+    (and rewriting existing rows) if the file already has a narrower header
+    from an older run. Returns the fieldnames to use for every row appended
+    from here on. Called once before the pairs loop so rows can be appended
+    one at a time as they're found, instead of batching until the run ends.
+    """
+    file_exists = os.path.exists(out_csv) and os.path.getsize(out_csv) > 0
+    if not file_exists:
+        with open(out_csv, 'w', newline='') as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+        return fieldnames
+
+    with open(out_csv, newline='') as f:
+        reader = csv.DictReader(f)
+        existing_header = reader.fieldnames or []
+        missing = [k for k in fieldnames if k not in existing_header]
+        if not missing:
+            return existing_header
+        existing_rows = list(reader)
+
+    widened = existing_header + missing
+    with open(out_csv, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=widened, extrasaction='ignore')
+        w.writeheader()
+        for r in existing_rows:
+            for k in widened:
+                r.setdefault(k, '')
+            w.writerow(r)
+    return widened
+
+
+def _methods_in_csv(out_csv, dataset_label, linkage):
+    """
+    Set of `which` (method names) already present for this (dataset, linkage)
+    in the CSV. Empty set if the file/rows don't exist.
+    """
+    present = set()
+    if not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
+        return present
+    with open(out_csv, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('dataset') == dataset_label and row.get('linkage') == linkage:
+                present.add(row.get('which'))
+    return present
