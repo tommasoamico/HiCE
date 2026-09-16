@@ -31,6 +31,14 @@ data (a dataset present in multiple input files has its rows merged):
    only), one bar per method, with the spread across pairs shown as an
    error bar.
 
+Additionally, four cross-dataset summary plots are produced ONCE (not per
+dataset), each a bar per method: mean validity rate, mean proximity, mean
+sparsity, and mean run time, all averaged ACROSS DATASETS -- i.e. each
+dataset present contributes one number per method, and the error bar shows
+the spread of that number across datasets (zero-width with a single
+dataset). These answer "which method generally does best/worst" rather
+than showing per-pair or per-dataset detail.
+
 Usage:
     python visualizations.py --csv data/iris.csv --out-dir figures
     python visualizations.py --csv data/iris.csv data/iris_sparsity.csv --out-dir figures
@@ -250,6 +258,72 @@ def plot_sparsity(df, out_path, order, labels, colors):
     print(f"[out] wrote {out_path}")
 
 
+def _per_dataset_method_stats(df, prox_col="l2"):
+    """
+    Collapse the combined multi-dataset dataframe to one row per
+    (dataset, method), with the same summary statistics the per-dataset
+    plots use. This is the input to the cross-dataset summary plots below:
+    each dataset contributes one data point per method, so a method's
+    spread across datasets becomes an error bar.
+    """
+    has_sparsity = "sparsity" in df.columns
+    rows = []
+    for (dataset, which), g in df.groupby(["dataset", "which"]):
+        n_total = len(g)
+        valid = g[g["valid"] == 1]
+        n_valid = len(valid)
+        rows.append(dict(
+            dataset=dataset, which=which,
+            validity_rate=(n_valid / n_total) if n_total else np.nan,
+            mean_prox=valid[prox_col].mean() if n_valid else np.nan,
+            mean_sparsity=(valid["sparsity"].mean()
+                           if has_sparsity and n_valid else np.nan),
+            mean_seconds=g["seconds"].mean() if "seconds" in g.columns else np.nan,
+        ))
+    return pd.DataFrame(rows)
+
+
+def plot_cross_dataset_summary(stats, metric, out_path, order, labels, colors,
+                                ylabel, title, pct=False):
+    """
+    Bar chart with one bar per method, averaged ACROSS DATASETS (each
+    dataset that has a defined value for `metric` and this method
+    contributes one point). Error bars show +/- 1 std across datasets, so
+    they collapse to zero with a single dataset. A method missing the
+    metric everywhere is skipped, leaving a gap in the bar sequence.
+    """
+    methods = [m for m in order if m in stats["which"].unique()]
+
+    bar_labels, means, stds, bar_colors, ns = [], [], [], [], []
+    for m in methods:
+        vals = stats.loc[stats["which"] == m, metric].dropna()
+        if len(vals) == 0:
+            continue
+        v = vals * 100 if pct else vals
+        bar_labels.append(labels.get(m, m))
+        means.append(v.mean())
+        stds.append(v.std() if len(v) > 1 else 0)
+        bar_colors.append(colors.get(m, "#4a3aa7"))
+        ns.append(len(v))
+
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+    x = np.arange(len(bar_labels))
+    ax.bar(x, means, yerr=stds, color=bar_colors, width=0.6,
+           capsize=4, error_kw=dict(ecolor=TEXT_SECONDARY, linewidth=1.2))
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{lbl}\n(n={n})" for lbl, n in zip(bar_labels, ns)])
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, color=TEXT_PRIMARY, fontsize=13, pad=12)
+    ax.set_ylim(bottom=0)
+    _style_axes(ax)
+    ax.xaxis.grid(False)
+    fig.tight_layout()
+    fig.savefig(out_path, facecolor="white")
+    plt.close(fig)
+    print(f"[out] wrote {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", type=str, nargs="+", default=["data/iris.csv"],
@@ -283,6 +357,37 @@ def main():
         plot_sparsity(
             sub, os.path.join(a.out_dir, f"{label}_sparsity.png"),
             order, labels, colors)
+
+    # cross-dataset summary: only meaningful with results from >1 dataset,
+    # but still produced (with zero-width error bars) for a single one.
+    if len(datasets) >= 1 and "dataset" in df.columns:
+        order, labels, colors = _build_style(df["which"].unique())
+        stats = _per_dataset_method_stats(df, prox_col=a.prox_col)
+
+        plot_cross_dataset_summary(
+            stats, "validity_rate",
+            os.path.join(a.out_dir, "summary_validity.png"),
+            order, labels, colors, pct=True,
+            ylabel="Mean validity rate (%)",
+            title=f"Validity by method, averaged across {len(datasets)} dataset(s)")
+        plot_cross_dataset_summary(
+            stats, "mean_prox",
+            os.path.join(a.out_dir, "summary_proximity.png"),
+            order, labels, colors,
+            ylabel=f"Mean proximity ({a.prox_col.upper()}, valid CFs)",
+            title=f"Proximity by method, averaged across {len(datasets)} dataset(s)")
+        plot_cross_dataset_summary(
+            stats, "mean_sparsity",
+            os.path.join(a.out_dir, "summary_sparsity.png"),
+            order, labels, colors, pct=True,
+            ylabel="Mean sparsity (% features changed, valid CFs)",
+            title=f"Sparsity by method, averaged across {len(datasets)} dataset(s)")
+        plot_cross_dataset_summary(
+            stats, "mean_seconds",
+            os.path.join(a.out_dir, "summary_runtime.png"),
+            order, labels, colors,
+            ylabel="Mean run time (seconds)",
+            title=f"Run time by method, averaged across {len(datasets)} dataset(s)")
 
 
 if __name__ == "__main__":
