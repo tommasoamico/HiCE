@@ -1,7 +1,22 @@
 """
-Visualizations for the hierarchical-counterfactuals results CSV (e.g. data/iris.csv).
+Visualizations for the hierarchical-counterfactuals results CSVs
+(e.g. data/iris.csv, produced by runHierarchical.py or runHiceSparsity.py).
 
-Two plots, one figure each:
+Accepts one or more --csv files. Every distinct "method" found across all
+of them is plotted together, so you can e.g. combine a runHierarchical.py
+results file (method/baseline/baseline2/dice/baycon) with a
+runHiceSparsity.py file (HiCE under different sparsity_mode settings) into
+one comparison.
+
+Two schemas are understood and normalized into a single 'which' column:
+  - runHierarchical.py output: already has a 'which' column
+    (method/baseline/baseline2/dice/baycon).
+  - runHiceSparsity.py output: has no 'which' column, instead a
+    'sparsity_mode' column (l2/l1/adaptive/baycon_mask) -- each mode is
+    treated as its own method, labeled "HiCE (<mode>)".
+
+Three plots, one figure each, produced PER DATASET found in the combined
+data (a dataset present in multiple input files has its rows merged):
 
 1. Validity/proximity trade-off: for each method, sort its valid counterfactuals
    by proximity (ascending L2) and plot the running mean L2 against the fraction
@@ -18,6 +33,7 @@ Two plots, one figure each:
 
 Usage:
     python visualizations.py --csv data/iris.csv --out-dir figures
+    python visualizations.py --csv data/iris.csv data/iris_sparsity.csv --out-dir figures
 """
 
 import argparse
@@ -49,6 +65,52 @@ METHOD_LABEL = {
     "baycon": "BayCon",
 }
 
+# Colors handed out (in order) to methods not covered by PALETTE above --
+# e.g. per-sparsity-mode HiCE variants coming from runHiceSparsity.py.
+EXTRA_COLORS = ["#8456ce", "#4a3aa7", "#c14fa5", "#0b8fa3", "#8a8f00", "#c96f1e"]
+
+
+def _load_and_normalize(csv_path):
+    """
+    Read one results CSV and make sure it has a 'which' column identifying
+    the method, regardless of which runner produced it.
+    """
+    df = pd.read_csv(csv_path)
+    if "which" not in df.columns:
+        if "sparsity_mode" in df.columns:
+            df = df.copy()
+            df["which"] = "hice_" + df["sparsity_mode"].astype(str)
+        else:
+            raise ValueError(
+                f"'{csv_path}' has neither a 'which' nor a 'sparsity_mode' "
+                f"column -- don't know how to identify its method(s).")
+    df["_source_csv"] = csv_path
+    return df
+
+
+def _build_style(methods):
+    """
+    Return (order, label_map, color_map) covering exactly `methods`,
+    known methods first (in METHOD_ORDER), then any unrecognized ones
+    (e.g. hice_<sparsity_mode>) sorted alphabetically, assigned colors
+    from EXTRA_COLORS.
+    """
+    known = [m for m in METHOD_ORDER if m in methods]
+    unknown = sorted(m for m in methods if m not in METHOD_ORDER)
+
+    order = known + unknown
+    labels = dict(METHOD_LABEL)
+    colors = dict(PALETTE)
+    for i, m in enumerate(unknown):
+        if m not in labels:
+            if m.startswith("hice_"):
+                labels[m] = f"HiCE ({m[len('hice_'):]})"
+            else:
+                labels[m] = m
+        if m not in colors:
+            colors[m] = EXTRA_COLORS[i % len(EXTRA_COLORS)]
+    return order, labels, colors
+
 
 def _style_axes(ax):
     ax.spines["top"].set_visible(False)
@@ -62,7 +124,7 @@ def _style_axes(ax):
     ax.yaxis.label.set_color(TEXT_PRIMARY)
 
 
-def plot_validity_proximity(df, out_path, prox_col="l2"):
+def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2"):
     """
     For each method: rank ALL its rows for a pair-set by proximity (only valid
     rows have a defined proximity; invalid rows count toward the denominator
@@ -71,7 +133,7 @@ def plot_validity_proximity(df, out_path, prox_col="l2"):
     counterfactuals seen so far. The curve for a method stops at its validity
     rate, since beyond that there are no more valid points left to average in.
     """
-    methods = [m for m in METHOD_ORDER if m in df["which"].unique()]
+    methods = [m for m in order if m in df["which"].unique()]
 
     fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
 
@@ -91,11 +153,11 @@ def plot_validity_proximity(df, out_path, prox_col="l2"):
         running_mean = valid_sorted.to_numpy().cumsum() / k
         x_frac = k / n_total
 
-        color = PALETTE.get(m, "#4a3aa7")
+        color = colors.get(m, "#4a3aa7")
         ax.plot(
             x_frac * 100, running_mean,
             color=color, linewidth=2, solid_capstyle="round",
-            label=f"{METHOD_LABEL.get(m, m)} (validity {n_valid/n_total:.0%})",
+            label=f"{labels.get(m, m)} (validity {n_valid/n_total:.0%})",
         )
         # mark the endpoint (= method's validity rate) with a dot
         ax.plot(x_frac[-1] * 100, running_mean[-1], "o",
@@ -114,23 +176,23 @@ def plot_validity_proximity(df, out_path, prox_col="l2"):
     print(f"[out] wrote {out_path}")
 
 
-def plot_runtime_per_pair(df, out_path):
+def plot_runtime_per_pair(df, out_path, order, labels, colors):
     """
     pair_idx on x, seconds on y, one marker series per method. A pair for
     which a method has no row (or only an errored row with no timing) simply
     has no marker there, producing a visible gap.
     """
-    methods = [m for m in METHOD_ORDER if m in df["which"].unique()]
+    methods = [m for m in order if m in df["which"].unique()]
 
     fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
 
     for i, m in enumerate(methods):
         sub = df[(df["which"] == m) & df["seconds"].notna()]
-        color = PALETTE.get(m, "#4a3aa7")
+        color = colors.get(m, "#4a3aa7")
         ax.scatter(
             sub["pair_idx"], sub["seconds"],
             color=color, s=28, alpha=0.85, edgecolors="white", linewidths=0.5,
-            label=METHOD_LABEL.get(m, m), zorder=3 + i,
+            label=labels.get(m, m), zorder=3 + i,
         )
 
     ax.set_xlabel("Pair index")
@@ -145,7 +207,7 @@ def plot_runtime_per_pair(df, out_path):
     print(f"[out] wrote {out_path}")
 
 
-def plot_sparsity(df, out_path):
+def plot_sparsity(df, out_path, order, labels, colors):
     """
     Bar chart of mean sparsity (fraction of features changed) per method,
     computed over VALID counterfactuals only. Error bars show +/- 1 std
@@ -157,25 +219,25 @@ def plot_sparsity(df, out_path):
               f"to populate it before plotting {out_path}")
         return
 
-    methods = [m for m in METHOD_ORDER if m in df["which"].unique()]
+    methods = [m for m in order if m in df["which"].unique()]
 
-    labels, means, stds, colors = [], [], [], []
+    bar_labels, means, stds, bar_colors = [], [], [], []
     for m in methods:
         sub = df[(df["which"] == m) & (df["valid"] == 1)]["sparsity"].dropna()
         if len(sub) == 0:
             continue
-        labels.append(METHOD_LABEL.get(m, m))
+        bar_labels.append(labels.get(m, m))
         means.append(sub.mean() * 100)
         stds.append(sub.std() * 100)
-        colors.append(PALETTE.get(m, "#4a3aa7"))
+        bar_colors.append(colors.get(m, "#4a3aa7"))
 
     fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
-    x = np.arange(len(labels))
-    ax.bar(x, means, yerr=stds, color=colors, width=0.6,
+    x = np.arange(len(bar_labels))
+    ax.bar(x, means, yerr=stds, color=bar_colors, width=0.6,
            capsize=4, error_kw=dict(ecolor=TEXT_SECONDARY, linewidth=1.2))
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels)
+    ax.set_xticklabels(bar_labels)
     ax.set_ylabel("Mean sparsity (% features changed)")
     ax.set_title("Sparsity by method (valid counterfactuals)",
                  color=TEXT_PRIMARY, fontsize=13, pad=12)
@@ -190,23 +252,37 @@ def plot_sparsity(df, out_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", type=str, default="data/iris.csv")
+    ap.add_argument("--csv", type=str, nargs="+", default=["data/iris.csv"],
+                     help="one or more results CSVs (runHierarchical.py and/or "
+                          "runHiceSparsity.py output); all methods found across "
+                          "them are combined into the same plots, per dataset")
     ap.add_argument("--out-dir", type=str, default="data/images")
     ap.add_argument("--prox-col", type=str, default="l2",
                      choices=["l2", "l2_sq", "l1", "linf"])
     a = ap.parse_args()
 
-    df = pd.read_csv(a.csv)
+    dfs = [_load_and_normalize(p) for p in a.csv]
+    df = pd.concat(dfs, ignore_index=True)
     os.makedirs(a.out_dir, exist_ok=True)
-    dataset = df["dataset"].iloc[0] if "dataset" in df.columns and len(df) else \
-        os.path.splitext(os.path.basename(a.csv))[0]
 
-    plot_validity_proximity(
-        df, os.path.join(a.out_dir, f"{dataset}_validity_proximity.png"), prox_col=a.prox_col)
-    plot_runtime_per_pair(
-        df, os.path.join(a.out_dir, f"{dataset}_runtime_per_pair.png"))
-    plot_sparsity(
-        df, os.path.join(a.out_dir, f"{dataset}_sparsity.png"))
+    datasets = df["dataset"].dropna().unique() if "dataset" in df.columns else [None]
+
+    for dataset in datasets:
+        sub = df if dataset is None else df[df["dataset"] == dataset]
+        if len(sub) == 0:
+            continue
+        order, labels, colors = _build_style(sub["which"].unique())
+        label = dataset if dataset is not None else "combined"
+
+        plot_validity_proximity(
+            sub, os.path.join(a.out_dir, f"{label}_validity_proximity.png"),
+            order, labels, colors, prox_col=a.prox_col)
+        plot_runtime_per_pair(
+            sub, os.path.join(a.out_dir, f"{label}_runtime_per_pair.png"),
+            order, labels, colors)
+        plot_sparsity(
+            sub, os.path.join(a.out_dir, f"{label}_sparsity.png"),
+            order, labels, colors)
 
 
 if __name__ == "__main__":
