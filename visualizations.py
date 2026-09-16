@@ -77,6 +77,16 @@ METHOD_LABEL = {
 # e.g. per-sparsity-mode HiCE variants coming from runHiceSparsity.py.
 EXTRA_COLORS = ["#8456ce", "#4a3aa7", "#c14fa5", "#0b8fa3", "#8a8f00", "#c96f1e"]
 
+# Nemenyi two-tailed critical values q_alpha (alpha=0.05) for k=2..20
+# competing methods, from Demsar (2006), "Statistical Comparisons of
+# Classifiers over Multiple Data Sets", Table 5(b). CD = q_alpha *
+# sqrt(k(k+1)/(6N)) for N datasets.
+NEMENYI_QALPHA_005 = {
+    2: 1.960, 3: 2.343, 4: 2.569, 5: 2.728, 6: 2.850, 7: 2.949, 8: 3.031,
+    9: 3.102, 10: 3.164, 11: 3.219, 12: 3.268, 13: 3.313, 14: 3.354,
+    15: 3.391, 16: 3.426, 17: 3.458, 18: 3.489, 19: 3.517, 20: 3.544,
+}
+
 
 def _load_and_normalize(csv_path):
     """
@@ -140,14 +150,27 @@ def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2"):
     mean proximity of the x-fraction-of-all-pairs most-proximal VALID
     counterfactuals seen so far. The curve for a method stops at its validity
     rate, since beyond that there are no more valid points left to average in.
+
+    Every method is measured against the SAME denominator: the number of
+    distinct pair_idx values present anywhere in `df` for this dataset (not
+    each method's own row count). This matters because some methods only
+    have rows for a strict subset of pairs -- e.g. runHiceSparsity.py's
+    baycon_mask mode writes no row at all for a pair when BayCon found no
+    counterfactual to derive a mask from, rather than an explicit invalid
+    row. Using that method's own (smaller, easier) row count as its
+    denominator would silently inflate its apparent validity rate and
+    misalign its curve against methods evaluated on every pair; a pair
+    missing from a method's rows is instead counted here as coverage the
+    method failed to reach, same as an explicit invalid row would be.
     """
     methods = [m for m in order if m in df["which"].unique()]
+    n_universe = df["pair_idx"].nunique() if "pair_idx" in df.columns else None
 
     fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
 
     for m in methods:
         sub = df[df["which"] == m]
-        n_total = len(sub)
+        n_total = n_universe if n_universe else len(sub)
         if n_total == 0:
             continue
         valid_sorted = sub.loc[sub["valid"] == 1, prox_col].dropna().sort_values()
@@ -156,7 +179,8 @@ def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2"):
             continue
 
         # running mean proximity of the k most-proximal valid CFs, at
-        # x = k / n_total (fraction of ALL pairs for this method)
+        # x = k / n_total (fraction of ALL pairs in the dataset, shared
+        # across methods)
         k = np.arange(1, n_valid + 1)
         running_mean = valid_sorted.to_numpy().cumsum() / k
         x_frac = k / n_total
@@ -324,6 +348,105 @@ def plot_cross_dataset_summary(stats, metric, out_path, order, labels, colors,
     print(f"[out] wrote {out_path}")
 
 
+def plot_critical_difference(stats, metric, out_path, order, labels, colors,
+                              ascending, title):
+    """
+    Demsar (2006)-style critical-difference diagram: for each dataset,
+    methods are ranked by `metric` (rank 1 = best; `ascending` sets whether
+    "best" means lowest or highest raw value); average ranks across
+    datasets are plotted on a number line, alongside a Nemenyi critical
+    difference (CD) bar, and methods whose average ranks differ by less
+    than CD are joined by a thick bar meaning "not significantly
+    different" (alpha=0.05, two-tailed).
+
+    Requires COMPLETE data: a dataset is only used if every method in
+    `order` that appears anywhere in `stats` has a non-NaN value for it
+    there (Friedman/Nemenyi need every method scored on every dataset).
+    Needs at least 2 methods and at least 3 complete datasets, and a
+    tabulated q_alpha (up to 20 methods); otherwise the plot is skipped.
+    """
+    methods = [m for m in order if m in stats["which"].unique()]
+    pivot = stats.pivot(index="dataset", columns="which", values=metric)
+    pivot = pivot.reindex(columns=methods).dropna(axis=0, how="any")
+    n, k = len(pivot), len(methods)
+
+    if k < 2 or n < 3:
+        print(f"[skip] not enough complete data for {out_path} "
+              f"(methods={k}, complete datasets={n}; need >=2 methods and "
+              f">=3 datasets with every method present)")
+        return
+    if k > max(NEMENYI_QALPHA_005):
+        print(f"[skip] no tabulated Nemenyi q_alpha for {k} methods; "
+              f"skipping {out_path}")
+        return
+
+    ranks = pivot.rank(axis=1, ascending=ascending)
+    avg_ranks = ranks.mean(axis=0).sort_values()
+    cd = NEMENYI_QALPHA_005[k] * np.sqrt(k * (k + 1) / (6.0 * n))
+    items = list(avg_ranks.items())  # [(method, avg_rank), ...] ascending
+
+    # maximal cliques of rank-adjacent methods within CD of each other
+    cliques = []
+    i = 0
+    while i < k:
+        j = i
+        while j + 1 < k and items[j + 1][1] - items[i][1] <= cd:
+            j += 1
+        cliques.append((i, j))
+        i += 1
+    cliques = [c for c in cliques if not any(
+        c != c2 and c2[0] <= c[0] and c[1] <= c2[1] for c2 in cliques)]
+
+    half = (k + 1) // 2
+    fig, ax = plt.subplots(figsize=(8, 2.4 + 0.4 * k), dpi=150)
+    ax.set_xlim(0.5, k + 0.5)
+    ax.axhline(0, color=TEXT_SECONDARY, linewidth=1.2)
+    for r in range(1, k + 1):
+        ax.plot([r, r], [-0.05, 0.05], color=TEXT_SECONDARY, linewidth=1)
+        ax.text(r, -0.15, str(r), ha="center", va="top", fontsize=8,
+                 color=TEXT_SECONDARY)
+
+    for idx, (m, r) in enumerate(items):
+        color = colors.get(m, "#4a3aa7")
+        if idx < half:
+            y_label = 0.6 + 0.35 * idx
+        else:
+            y_label = -0.6 - 0.35 * (idx - half)
+        ax.plot([r, r], [0, y_label], color=color, linewidth=1.2)
+        ax.plot(r, 0, "o", color=color, markersize=5, zorder=5)
+        ax.text(r, y_label + (0.08 if y_label > 0 else -0.08),
+                 f"{labels.get(m, m)} ({r:.2f})", ha="center",
+                 va="bottom" if y_label > 0 else "top", fontsize=9,
+                 color=TEXT_PRIMARY)
+
+    top_extent = 0.6 + 0.35 * (half - 1) if half > 0 else 0.6
+    bottom_extent = 0.6 + 0.35 * (k - half - 1) if k - half > 0 else 0.6
+
+    cd_y = top_extent + 0.6
+    ax.plot([1, 1 + cd], [cd_y, cd_y], color=TEXT_PRIMARY, linewidth=1.5)
+    ax.plot([1, 1], [cd_y - 0.05, cd_y + 0.05], color=TEXT_PRIMARY, linewidth=1.5)
+    ax.plot([1 + cd, 1 + cd], [cd_y - 0.05, cd_y + 0.05], color=TEXT_PRIMARY, linewidth=1.5)
+    ax.text(1 + cd / 2, cd_y + 0.12, f"CD = {cd:.2f}", ha="center",
+             fontsize=9, color=TEXT_PRIMARY)
+
+    clique_y0 = -bottom_extent - 0.35
+    for ci, (a_i, b_i) in enumerate(cliques):
+        y = clique_y0 - 0.22 * ci
+        ax.plot([items[a_i][1], items[b_i][1]], [y, y],
+                color=TEXT_PRIMARY, linewidth=3, solid_capstyle="round")
+
+    ax.set_ylim(clique_y0 - 0.22 * len(cliques) - 0.3, cd_y + 0.4)
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title(f"{title}\n(N={n} datasets, k={k} methods, Nemenyi α=0.05)",
+                 color=TEXT_PRIMARY, fontsize=12, pad=12)
+    fig.tight_layout()
+    fig.savefig(out_path, facecolor="white")
+    plt.close(fig)
+    print(f"[out] wrote {out_path} (N={n}, k={k}, CD={cd:.3f})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", type=str, nargs="+", default=["data/iris.csv"],
@@ -388,6 +511,25 @@ def main():
             order, labels, colors,
             ylabel="Mean run time (seconds)",
             title=f"Run time by method, averaged across {len(datasets)} dataset(s)")
+
+        # Nemenyi critical-difference diagrams (need complete, >=3-dataset
+        # data across methods -- plot_critical_difference skips otherwise)
+        plot_critical_difference(
+            stats, "validity_rate", os.path.join(a.out_dir, "cd_validity.png"),
+            order, labels, colors, ascending=False,
+            title="Critical difference — validity rate")
+        plot_critical_difference(
+            stats, "mean_prox", os.path.join(a.out_dir, "cd_proximity.png"),
+            order, labels, colors, ascending=True,
+            title=f"Critical difference — proximity ({a.prox_col.upper()})")
+        plot_critical_difference(
+            stats, "mean_sparsity", os.path.join(a.out_dir, "cd_sparsity.png"),
+            order, labels, colors, ascending=True,
+            title="Critical difference — sparsity")
+        plot_critical_difference(
+            stats, "mean_seconds", os.path.join(a.out_dir, "cd_runtime.png"),
+            order, labels, colors, ascending=True,
+            title="Critical difference — run time")
 
 
 if __name__ == "__main__":
