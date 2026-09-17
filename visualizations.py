@@ -45,10 +45,11 @@ dataset):
   bar shows the spread of that number across datasets (zero-width with a
   single dataset).
 
-- cd_{validity,proximity,sparsity,runtime}.png: Nemenyi critical-difference
-  diagrams (Demsar 2006) ranking methods per dataset and testing whether
+- cd_{validity,proximity,sparsity,runtime}.png: critical-difference plots
+  produced by the `autorank` package (Nemenyi post-hoc test, forced
+  nonparametric mode), ranking methods per dataset and testing whether
   their average ranks differ significantly (alpha=0.05); skipped if there
-  are fewer than 3 datasets with complete data across every method.
+  are fewer than 2 datasets with complete data across every method.
 
 Usage:
     python visualizations.py --csv data/iris.csv --out-dir figures
@@ -58,6 +59,7 @@ Usage:
 import argparse
 import os
 
+import autorank
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -87,16 +89,6 @@ METHOD_LABEL = {
 # Colors handed out (in order) to methods not covered by PALETTE above --
 # e.g. per-sparsity-mode HiCE variants coming from runHiceSparsity.py.
 EXTRA_COLORS = ["#8456ce", "#4a3aa7", "#c14fa5", "#0b8fa3", "#8a8f00", "#c96f1e"]
-
-# Nemenyi two-tailed critical values q_alpha (alpha=0.05) for k=2..20
-# competing methods, from Demsar (2006), "Statistical Comparisons of
-# Classifiers over Multiple Data Sets", Table 5(b). CD = q_alpha *
-# sqrt(k(k+1)/(6N)) for N datasets.
-NEMENYI_QALPHA_005 = {
-    2: 1.960, 3: 2.343, 4: 2.569, 5: 2.728, 6: 2.850, 7: 2.949, 8: 3.031,
-    9: 3.102, 10: 3.164, 11: 3.219, 12: 3.268, 13: 3.313, 14: 3.354,
-    15: 3.391, 16: 3.426, 17: 3.458, 18: 3.489, 19: 3.517, 20: 3.544,
-}
 
 
 def _load_and_normalize(csv_path):
@@ -368,102 +360,49 @@ def plot_cross_dataset_summary(stats, metric, out_path, order, labels, colors,
 
 
 def plot_critical_difference(stats, metric, out_path, order, labels, colors,
-                              ascending, title):
+                              ascending, title, alpha=0.05):
     """
-    Demsar (2006)-style critical-difference diagram: for each dataset,
-    methods are ranked by `metric` (rank 1 = best; `ascending` sets whether
-    "best" means lowest or highest raw value); average ranks across
-    datasets are plotted on a number line, alongside a Nemenyi critical
-    difference (CD) bar, and methods whose average ranks differ by less
-    than CD are joined by a thick bar meaning "not significantly
-    different" (alpha=0.05, two-tailed).
+    Critical-difference plot via the `autorank` package (forced
+    nonparametric mode -> Friedman test + Nemenyi post-hoc), ranking
+    methods per dataset by `metric` ('ascending'==lower raw value is
+    better, i.e. proximity/sparsity/runtime; 'descending'==higher raw
+    value is better, i.e. validity) and testing whether their average
+    ranks differ significantly at level `alpha`.
+
+    `colors` is accepted for signature symmetry with the other summary
+    plots but unused: autorank owns the figure's styling internally.
 
     Requires COMPLETE data: a dataset is only used if every method in
     `order` that appears anywhere in `stats` has a non-NaN value for it
-    there (Friedman/Nemenyi need every method scored on every dataset).
-    Needs at least 2 methods and at least 3 complete datasets, and a
-    tabulated q_alpha (up to 20 methods); otherwise the plot is skipped.
+    there. autorank hard-requires at least 5 such complete datasets (and
+    at least 2 methods); otherwise the plot is skipped.
     """
     methods = [m for m in order if m in stats["which"].unique()]
     pivot = stats.pivot(index="dataset", columns="which", values=metric)
     pivot = pivot.reindex(columns=methods).dropna(axis=0, how="any")
     n, k = len(pivot), len(methods)
 
-    if k < 2 or n < 3:
+    if k < 2 or n < 5:
         print(f"[skip] not enough complete data for {out_path} "
-              f"(methods={k}, complete datasets={n}; need >=2 methods and "
-              f">=3 datasets with every method present)")
-        return
-    if k > max(NEMENYI_QALPHA_005):
-        print(f"[skip] no tabulated Nemenyi q_alpha for {k} methods; "
-              f"skipping {out_path}")
+              f"(methods={k}, complete datasets={n}; autorank needs >=2 "
+              f"methods and >=5 datasets with every method present)")
         return
 
-    ranks = pivot.rank(axis=1, ascending=ascending)
-    avg_ranks = ranks.mean(axis=0).sort_values()
-    cd = NEMENYI_QALPHA_005[k] * np.sqrt(k * (k + 1) / (6.0 * n))
-    items = list(avg_ranks.items())  # [(method, avg_rank), ...] ascending
+    mat = pivot.rename(columns=labels)
+    order_dir = "ascending" if ascending else "descending"
+    result = autorank.autorank(mat, alpha=alpha, order=order_dir,
+                                force_mode="nonparametric", verbose=False)
 
-    # maximal cliques of rank-adjacent methods within CD of each other
-    cliques = []
-    i = 0
-    while i < k:
-        j = i
-        while j + 1 < k and items[j + 1][1] - items[i][1] <= cd:
-            j += 1
-        cliques.append((i, j))
-        i += 1
-    cliques = [c for c in cliques if not any(
-        c != c2 and c2[0] <= c[0] and c[1] <= c2[1] for c2 in cliques)]
-
-    half = (k + 1) // 2
-    fig, ax = plt.subplots(figsize=(8, 2.4 + 0.4 * k), dpi=150)
-    ax.set_xlim(0.5, k + 0.5)
-    ax.axhline(0, color=TEXT_SECONDARY, linewidth=1.2)
-    for r in range(1, k + 1):
-        ax.plot([r, r], [-0.05, 0.05], color=TEXT_SECONDARY, linewidth=1)
-        ax.text(r, -0.15, str(r), ha="center", va="top", fontsize=8,
-                 color=TEXT_SECONDARY)
-
-    for idx, (m, r) in enumerate(items):
-        color = colors.get(m, "#4a3aa7")
-        if idx < half:
-            y_label = 0.6 + 0.35 * idx
-        else:
-            y_label = -0.6 - 0.35 * (idx - half)
-        ax.plot([r, r], [0, y_label], color=color, linewidth=1.2)
-        ax.plot(r, 0, "o", color=color, markersize=5, zorder=5)
-        ax.text(r, y_label + (0.08 if y_label > 0 else -0.08),
-                 f"{labels.get(m, m)} ({r:.2f})", ha="center",
-                 va="bottom" if y_label > 0 else "top", fontsize=9,
-                 color=TEXT_PRIMARY)
-
-    top_extent = 0.6 + 0.35 * (half - 1) if half > 0 else 0.6
-    bottom_extent = 0.6 + 0.35 * (k - half - 1) if k - half > 0 else 0.6
-
-    cd_y = top_extent + 0.6
-    ax.plot([1, 1 + cd], [cd_y, cd_y], color=TEXT_PRIMARY, linewidth=1.5)
-    ax.plot([1, 1], [cd_y - 0.05, cd_y + 0.05], color=TEXT_PRIMARY, linewidth=1.5)
-    ax.plot([1 + cd, 1 + cd], [cd_y - 0.05, cd_y + 0.05], color=TEXT_PRIMARY, linewidth=1.5)
-    ax.text(1 + cd / 2, cd_y + 0.12, f"CD = {cd:.2f}", ha="center",
-             fontsize=9, color=TEXT_PRIMARY)
-
-    clique_y0 = -bottom_extent - 0.35
-    for ci, (a_i, b_i) in enumerate(cliques):
-        y = clique_y0 - 0.22 * ci
-        ax.plot([items[a_i][1], items[b_i][1]], [y, y],
-                color=TEXT_PRIMARY, linewidth=3, solid_capstyle="round")
-
-    ax.set_ylim(clique_y0 - 0.22 * len(cliques) - 0.3, cd_y + 0.4)
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.set_title(f"{title}\n(N={n} datasets, k={k} methods, Nemenyi α=0.05)",
-                 color=TEXT_PRIMARY, fontsize=12, pad=12)
-    fig.tight_layout()
-    fig.savefig(out_path, facecolor="white")
+    plt.close("all")
+    autorank.plot_stats(result, allow_insignificant=True)
+    fig = plt.gcf()
+    fig.set_dpi(150)
+    fig.suptitle(f"{title}\n(N={n} datasets, k={k} methods)",
+                 fontsize=13, y=1.22)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
-    print(f"[out] wrote {out_path} (N={n}, k={k}, CD={cd:.3f})")
+    print(f"[out] wrote {out_path} (N={n}, k={k})")
+    print(result.rankdf.sort_values("meanrank"))
 
 
 def main():
