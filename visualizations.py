@@ -31,13 +31,24 @@ data (a dataset present in multiple input files has its rows merged):
    only), one bar per method, with the spread across pairs shown as an
    error bar.
 
-Additionally, four cross-dataset summary plots are produced ONCE (not per
-dataset), each a bar per method: mean validity rate, mean proximity, mean
-sparsity, and mean run time, all averaged ACROSS DATASETS -- i.e. each
-dataset present contributes one number per method, and the error bar shows
-the spread of that number across datasets (zero-width with a single
-dataset). These answer "which method generally does best/worst" rather
-than showing per-pair or per-dataset detail.
+Additionally, the following summary plots are produced ONCE (not per
+dataset):
+
+- summary_validity_proximity.png: the same validity/proximity trade-off
+  curve as above, but pooling every pair from every dataset into one
+  curve per method, instead of one figure per dataset.
+
+- summary_{validity,proximity,sparsity,runtime}.png: four bar charts, one
+  per metric, each a bar per method: mean validity rate, mean proximity,
+  mean sparsity, and mean run time, all averaged ACROSS DATASETS -- i.e.
+  each dataset present contributes one number per method, and the error
+  bar shows the spread of that number across datasets (zero-width with a
+  single dataset).
+
+- cd_{validity,proximity,sparsity,runtime}.png: Nemenyi critical-difference
+  diagrams (Demsar 2006) ranking methods per dataset and testing whether
+  their average ranks differ significantly (alpha=0.05); skipped if there
+  are fewer than 3 datasets with complete data across every method.
 
 Usage:
     python visualizations.py --csv data/iris.csv --out-dir figures
@@ -142,7 +153,8 @@ def _style_axes(ax):
     ax.yaxis.label.set_color(TEXT_PRIMARY)
 
 
-def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2"):
+def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2",
+                             title="Validity vs. proximity trade-off"):
     """
     For each method: rank ALL its rows for a pair-set by proximity (only valid
     rows have a defined proximity; invalid rows count toward the denominator
@@ -152,10 +164,12 @@ def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2"):
     rate, since beyond that there are no more valid points left to average in.
 
     Every method is measured against the SAME denominator: the number of
-    distinct pair_idx values present anywhere in `df` for this dataset (not
-    each method's own row count). This matters because some methods only
-    have rows for a strict subset of pairs -- e.g. runHiceSparsity.py's
-    baycon_mask mode writes no row at all for a pair when BayCon found no
+    distinct pairs present anywhere in `df` (not each method's own row
+    count) -- distinct (dataset, pair_idx) combinations if `df` spans
+    multiple datasets (e.g. a cross-dataset summary plot), else just
+    distinct pair_idx. This matters because some methods only have rows
+    for a strict subset of pairs -- e.g. runHiceSparsity.py's baycon_mask
+    mode writes no row at all for a pair when BayCon found no
     counterfactual to derive a mask from, rather than an explicit invalid
     row. Using that method's own (smaller, easier) row count as its
     denominator would silently inflate its apparent validity rate and
@@ -164,7 +178,12 @@ def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2"):
     method failed to reach, same as an explicit invalid row would be.
     """
     methods = [m for m in order if m in df["which"].unique()]
-    n_universe = df["pair_idx"].nunique() if "pair_idx" in df.columns else None
+    if "pair_idx" not in df.columns:
+        n_universe = None
+    elif "dataset" in df.columns and df["dataset"].nunique() > 1:
+        n_universe = len(df[["dataset", "pair_idx"]].drop_duplicates())
+    else:
+        n_universe = df["pair_idx"].nunique()
 
     fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
 
@@ -198,7 +217,7 @@ def plot_validity_proximity(df, out_path, order, labels, colors, prox_col="l2"):
 
     ax.set_xlabel("Most-proximal fraction of pairs (%)")
     ax.set_ylabel(f"Mean proximity ({prox_col.upper()}) of the top-x% valid CFs")
-    ax.set_title("Validity vs. proximity trade-off", color=TEXT_PRIMARY, fontsize=13, pad=12)
+    ax.set_title(title, color=TEXT_PRIMARY, fontsize=13, pad=12)
     ax.set_xlim(0, 100)
     _style_axes(ax)
     ax.legend(frameon=False, fontsize=9, labelcolor=TEXT_PRIMARY, loc="best")
@@ -486,6 +505,15 @@ def main():
     if len(datasets) >= 1 and "dataset" in df.columns:
         order, labels, colors = _build_style(df["which"].unique())
         stats = _per_dataset_method_stats(df, prox_col=a.prox_col)
+
+        # validity/proximity trade-off pooling every pair from every
+        # dataset into one curve per method (vs. the per-dataset plots
+        # above, which are one dataset each)
+        plot_validity_proximity(
+            df, os.path.join(a.out_dir, "summary_validity_proximity.png"),
+            order, labels, colors, prox_col=a.prox_col,
+            title=f"Validity vs. proximity trade-off, all pairs pooled "
+                  f"across {len(datasets)} dataset(s)")
 
         plot_cross_dataset_summary(
             stats, "validity_rate",
