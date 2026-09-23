@@ -1,6 +1,6 @@
 from typing import List, Dict, Iterable
 import numpy as np
-from modules.utilityFunctions import project_sphere_closed_form, project_single_sphere_sdp, active, feasible, unit, ward_info, complete_linkage_max
+from modules.utilityFunctions import project_sphere_closed_form, project_single_sphere_sdp, active, feasible, unit, ward_info, complete_linkage_max, get_children
 import miniball
 from scipy.spatial.distance import cdist
 from scipy.optimize import  milp, LinearConstraint, Bounds
@@ -283,7 +283,7 @@ class hiceCounterfactuals:
                                anchor='min', eps=1e-6, index_to_name=None,
                                exhaustive=False, socp_solver=None,
                                sparsity=True, lam=1.0, verbose=False,
-                               allowed_features=None):
+                               allowed_features=None, extra_competitors=None):
         """
         Ward-linkage counterfactual: rigidly translate branch A by t so A becomes
         Ward-closer to target branch B than to every live competitor.
@@ -355,6 +355,15 @@ class hiceCounterfactuals:
                             the reverse-convex repair remain exact and are
                             NOT disabled by this mask (unlike sparsity=True,
                             whose L1 term does break them).
+        extra_competitors : list of leaf-index lists, optional
+                            Additional competitors injected on top of the live
+                            structural competitor set, each treated exactly
+                            like any other competitor node (its centroid/size
+                            feed the same Apollonius construction). Used by
+                            diverseCounterfactuals to bias A towards a
+                            specific sub-branch of B by adding B's sibling
+                            sub-branch as a competitor, without re-targeting
+                            the objective away from B ("framing B").
 
         Returns
         -------
@@ -362,14 +371,73 @@ class hiceCounterfactuals:
         info : dict  t, feasible, optimal, distance_moved, n_competitors,
                     active_balls, phase, plus sparsity/lam echoed back.
         """
+        base = self._build_ward_geometry(B_leaves, A_leaves, anchor=anchor,
+                                          allowed_features=allowed_features,
+                                          sparsity=sparsity, lam=lam, verbose=verbose)
+        if base is None:
+            raise ValueError("A_leaves and B_leaves resolve to the same node.")
+
+        A_pts, mu_A, mu_B, n_A = base["A_pts"], base["mu_A"], base["mu_B"], base["n_A"]
+        free_idx, fixed_idx, E, k_free = base["free_idx"], base["fixed_idx"], base["E"], base["k_free"]
+        sparsity, lam, use_sparsity = base["sparsity"], base["lam"], base["use_sparsity"]
+        allowed_features = base["allowed_features"]
+        d = base["d"]
+        w_B = base["w_B"]
+
+        competitor_nodes = dict(base["competitor_nodes"])
+        convex_ball_in = list(base["convex_ball_in"])
+        convex_half = list(base["convex_half"])
+        rev_balls = list(base["rev_balls"])
+
+        if extra_competitors:
+            for i, leaves in enumerate(extra_competitors):
+                leaves_sorted = sorted(int(l) for l in leaves)
+                nid = f"__extra_{i}__"
+                competitor_nodes[nid] = leaves_sorted
+                self._add_competitor_apollonius(nid, leaves_sorted, mu_A, mu_B, n_A, w_B,
+                                                 convex_ball_in, convex_half, rev_balls)
+
+        if verbose:
+            print(f"n_A={n_A}(s_A={base['s_A']}) n_B={base['n_B']}(s_B={base['s_B']}) "
+                f"competitors={len(competitor_nodes)} sparsity={sparsity} lam={lam}")
+
+        if not competitor_nodes:
+            info = ward_info(np.zeros(d), True, True, 0, [], "guard-no-competitors")
+            info["sparsity"] = sparsity; info["lam"] = lam if sparsity else 0.0
+            info["allowed_features"] = None if allowed_features is None else np.asarray(allowed_features).tolist()
+            return A_pts.copy(), info
+
+        if socp_solver is None:
+            socp_solver = cp.CLARABEL if hasattr(cp, "CLARABEL") else cp.ECOS
+
+        return self._solve_ward_core(A_pts, mu_A, mu_B, E, free_idx, fixed_idx, k_free,
+                                      convex_ball_in, convex_half, rev_balls,
+                                      sparsity, lam, use_sparsity, allowed_features,
+                                      len(competitor_nodes), d, socp_solver,
+                                      exhaustive, index_to_name)
+
+    def _build_ward_geometry(self, B_leaves, A_leaves, anchor='min',
+                              allowed_features=None, sparsity=True, lam=1.0,
+                              verbose=False):
+        """
+        Build the part of a Ward branch counterfactual that is identical
+        regardless of which extra (sibling) competitors get layered on top:
+        resolves A/B, the feature-subspace mask, the base live competitor set
+        (live blocks at the anchor step excluding A and B, plus A's own
+        unmoved position), and that base set's Apollonius data. This is the
+        "build" half of counterfactual_ward_branch, extracted so
+        diverseCounterfactuals can compute it once and reuse it at every node
+        of B's subtree instead of rebuilding it per node.
+
+        Returns None if A and B resolve to the same node (caller raises).
+        """
         n = len(self.X)
         d = self.X.shape[1]
 
-        # ---- Step 0: resolve A, B as static wholes ----
         A_node, A_leaves_sorted, s_A = self._resolve_branch(A_leaves)
         B_node, B_leaves_sorted, s_B = self._resolve_branch(B_leaves)
         if A_node == B_node:
-            raise ValueError("A_leaves and B_leaves resolve to the same node.")
+            return None
 
         A_pts = np.asarray(self.X[A_leaves_sorted], dtype=float)
         B_pts = np.asarray(self.X[B_leaves_sorted], dtype=float)
@@ -414,44 +482,18 @@ class hiceCounterfactuals:
         s_star = min(s_A, s_B)
         live_partition = self._alive_clusters_before_row(s_star + 1)
 
-        # ---- Step 2: competitor set ----
+        # ---- Step 2: base competitor set ----
         A_set, B_set = set(A_leaves_sorted), set(B_leaves_sorted)
         competitor_nodes = {nid: leaves for nid, leaves in live_partition.items()
                             if not (set(leaves) <= A_set or set(leaves) <= B_set)}
 
-        if verbose:
-            print(f"n_A={n_A}(s_A={s_A}) n_B={n_B}(s_B={s_B}) s*={s_star} "
-                f"competitors={len(competitor_nodes)} sparsity={sparsity} lam={lam}")
-
-        if not competitor_nodes:
-            info = ward_info(np.zeros(d), True, True, 0, [], "guard-no-competitors")
-            info["sparsity"] = sparsity; info["lam"] = lam if sparsity else 0.0
-            info["allowed_features"] = None if allowed_features is None else np.asarray(allowed_features).tolist()
-            return A_pts.copy(), info
-
-        # ---- Apollonius data (objective-independent) ----
-        convex_ball_in = []   # (kappa, R)         ||p-kappa|| <= R
-        convex_half = []      # (a, b)             a·p <= b
-        rev_balls = []        # {kappa, R, nid}    ||p-kappa|| >= R  (reverse-convex)
-
-        for nid, leaves in competitor_nodes.items():
-            mu_X = np.asarray(self.X[leaves], dtype=float).mean(axis=0)
-            n_X = len(leaves)
-            coeff = w_B - w(n_X)
-            bvec = w_B * mu_B - w(n_X) * mu_X
-            cval = w_B * (mu_B @ mu_B) - w(n_X) * (mu_X @ mu_X)
-            if abs(coeff) < 1e-12:
-                convex_half.append((-2.0 * bvec, -cval))
-            else:
-                kappa = bvec / coeff
-                R = np.sqrt(max(kappa @ kappa - cval / coeff, 0.0))
-                (convex_ball_in if coeff > 0 else rev_balls).append(
-                    (kappa, R) if coeff > 0 else {'kappa': kappa, 'R': R, 'nid': nid})
-
-        #rho = float(np.linalg.norm(mu_B - mu_A))
-
-        if socp_solver is None:
-            socp_solver = cp.CLARABEL if hasattr(cp, "CLARABEL") else cp.ECOS
+        # Always add A's own unmoved position as a competitor: a counterfactual
+        # that leaves A exactly where it already was is not a real
+        # counterfactual, even if A happens to already dominate every live
+        # structural competitor (e.g. when A is the sibling of the branch the
+        # last query moved). This never removes a solution that genuinely
+        # requires movement — it only rules out the degenerate t=0 answer.
+        competitor_nodes["__A_unmoved__"] = A_leaves_sorted
 
         # ---- feature-subspace embedding: p = mu_A + E @ t_free, t_free in R^k ----
         # k = len(free_idx) <= d. E is the d x k matrix scattering the free
@@ -460,6 +502,68 @@ class hiceCounterfactuals:
         k_free = len(free_idx)
         E = np.eye(d)[:, free_idx]
 
+        # ---- Apollonius data for the base competitor set only ----
+        convex_ball_in = []   # (kappa, R)         ||p-kappa|| <= R
+        convex_half = []      # (a, b)             a·p <= b
+        rev_balls = []        # {kappa, R, nid}    ||p-kappa|| >= R  (reverse-convex)
+        for nid, leaves in competitor_nodes.items():
+            self._add_competitor_apollonius(nid, leaves, mu_A, mu_B, n_A, w_B,
+                                             convex_ball_in, convex_half, rev_balls)
+
+        return {
+            "A_node": A_node, "A_leaves_sorted": A_leaves_sorted, "s_A": s_A,
+            "B_node": B_node, "B_leaves_sorted": B_leaves_sorted, "s_B": s_B,
+            "A_pts": A_pts, "B_pts": B_pts, "n_A": n_A, "n_B": n_B,
+            "mu_A": mu_A, "mu_B": mu_B, "w_B": w_B,
+            "free_idx": free_idx, "fixed_idx": fixed_idx, "E": E, "k_free": k_free,
+            "sparsity": sparsity, "lam": lam, "use_sparsity": use_sparsity,
+            "allowed_features": allowed_features, "d": d,
+            "competitor_nodes": competitor_nodes,
+            "convex_ball_in": convex_ball_in, "convex_half": convex_half, "rev_balls": rev_balls,
+        }
+
+    def _add_competitor_apollonius(self, nid, leaves, mu_A, mu_B, n_A, w_B,
+                                    convex_ball_in, convex_half, rev_balls):
+        """
+        Compute one competitor's Apollonius constraint (ball/half-space, typed
+        by sign(w_B - w(n_X)), exactly the per-competitor construction used in
+        counterfactual_ward_branch) and append it in place to the matching
+        list. Returns (kind, list_index) so a caller can undo the append later
+        via list.pop() -- used by diverseCounterfactuals to accumulate/retract
+        sibling competitors during its DFS traversal without rebuilding the
+        base geometry.
+        """
+        mu_X = np.asarray(self.X[leaves], dtype=float).mean(axis=0)
+        n_X = len(leaves)
+
+        def w(nS):
+            return 2.0 * n_A * nS / (n_A + nS)
+
+        coeff = w_B - w(n_X)
+        bvec = w_B * mu_B - w(n_X) * mu_X
+        cval = w_B * (mu_B @ mu_B) - w(n_X) * (mu_X @ mu_X)
+        if abs(coeff) < 1e-12:
+            convex_half.append((-2.0 * bvec, -cval))
+            return ("half", len(convex_half) - 1)
+        kappa = bvec / coeff
+        R = np.sqrt(max(kappa @ kappa - cval / coeff, 0.0))
+        if coeff > 0:
+            convex_ball_in.append((kappa, R))
+            return ("ball_in", len(convex_ball_in) - 1)
+        rev_balls.append({"kappa": kappa, "R": R, "nid": nid})
+        return ("rev", len(rev_balls) - 1)
+
+    def _solve_ward_core(self, A_pts, mu_A, mu_B, E, free_idx, fixed_idx, k_free,
+                          convex_ball_in, convex_half, rev_balls,
+                          sparsity, lam, use_sparsity, allowed_features,
+                          n_competitors, d, socp_solver, exhaustive, index_to_name):
+        """
+        Phase 1-4 solve logic of counterfactual_ward_branch, extracted to
+        operate on already-built Apollonius data (convex_ball_in/convex_half/
+        rev_balls) so it can be reused across nodes of a diversity traversal
+        without rebuilding the geometry. Semantics are byte-for-byte
+        identical to the inline version this replaces.
+        """
         # ---- objective helper (numeric, for scoring / SLSQP) ----
         def obj_val(p):
             t = p - mu_A
@@ -570,7 +674,7 @@ class hiceCounterfactuals:
         # convenience for the info dict
         def _finish(p, phase, optimal):
             t = p - mu_A
-            info = ward_info(t, True, optimal, len(competitor_nodes),
+            info = ward_info(t, True, optimal, n_competitors,
                             active(p, rev_balls, index_to_name), phase)
             info["sparsity"] = sparsity
             info["lam"] = lam if sparsity else 0.0
@@ -634,6 +738,227 @@ class hiceCounterfactuals:
         opt = exhaustive and not use_sparsity
         phase = ("phase4-exhaustive" if exhaustive else "phase4-earlystop")
         return _finish(best_p, phase, opt)
+
+    def diverseCounterfactuals(self, B_leaves, A_leaves, max_depth=None,
+                                both_children=False, **kwargs):
+        """
+        Hierarchical diverse counterfactuals for Ward-linkage: descend B's own
+        dendrogram subtree. The original "under B" domination constraints
+        (A must still dominate B's own live structural competitors, built
+        once via _build_ward_geometry) are always kept, so every result
+        remains a valid counterfactual for the original (A, B) problem. On
+        top of those, at each split a direct sibling-preference constraint
+        is accumulated to bias the solution toward a specific child:
+
+            d(A(t), child_target) < d(A(t), child_sibling)
+
+        i.e. "closer to the target child's own centroid than to its
+        sibling's own centroid" -- literally the condition for A(t) to land
+        on the target child's side of the child_target/child_sibling
+        Apollonius bisector. This is NOT the same as (and replaces) simply
+        adding the sibling as a competitor against B: since B is the parent
+        of both children, "closer to the whole of B than to sibling" can
+        hold while A(t) is still on the sibling's own side of the two
+        children's bisector -- comparing the two children directly is what
+        actually forces the split. It is exactly one more Apollonius
+        constraint of the same squared quadratic form _add_competitor_
+        apollonius already builds for ordinary competitors (near=target,
+        far=competitor); here near=child_target, far=child_sibling instead
+        of near=B, far=competitor, using child_target's own centroid/weight
+        (not B's) -- the same builder handles both, since its derivation
+        never actually required one side to be B.
+
+        Level 0 is the base counterfactual (target B, no sibling-preference
+        constraints yet -- the objective itself always stays centered on
+        A's own original position with the original B-domination
+        constraints; only the accumulated sibling-preference constraints
+        change what's added as depth increases). At an internal node with
+        children (cL, cR), descending into cL adds d(A,cL) < d(A,cR) on top
+        of everything accumulated so far (and symmetrically for cR).
+        Feasible regions are nested and shrink with depth (F_0 superset F_1
+        superset ...), so once a node is infeasible, its descendants are
+        not attempted (pruned).
+
+        Parameters
+        ----------
+        B_leaves, A_leaves : list of int
+            Target branch B and moving branch A, as in counterfactual_ward_branch.
+        max_depth : int, optional
+            Maximum recursion depth (0 = only the base counterfactual). None
+            descends all the way to B's leaves.
+        both_children : bool
+            If False (default), only descend into the child that the
+            *current* solution is NOT already closer to (the sibling not yet
+            reflected in the current solution), avoiding a near-duplicate of
+            the parent CF. If True, descend into both children at every
+            internal node, producing one counterfactual per node of B's
+            subtree.
+        **kwargs
+            Forwarded to counterfactual_ward_branch (e.g. eps, sparsity, lam,
+            index_to_name, socp_solver, allowed_features).
+
+        Returns
+        -------
+        results : list of dict, one per generated counterfactual, each with
+            'target_node'   : node id of B's subtree this CF specializes to
+            'path'          : list of (chosen_child, sibling) node-id pairs
+                              accumulated down B's subtree to reach this node
+            'A_prime', 'info' : outputs of counterfactual_ward_branch
+            'depth'         : recursion depth (0 = base counterfactual)
+        """
+        # ---- build the base geometry ONCE; it is identical at every node ----
+        base = self._build_ward_geometry(
+            B_leaves, A_leaves,
+            anchor=kwargs.get('anchor', 'min'),
+            allowed_features=kwargs.get('allowed_features'),
+            sparsity=kwargs.get('sparsity', True),
+            lam=kwargs.get('lam', 1.0),
+            verbose=kwargs.get('verbose', False),
+        )
+        if base is None:
+            raise ValueError("A_leaves and B_leaves resolve to the same node.")
+
+        socp_solver = kwargs.get('socp_solver')
+        if socp_solver is None:
+            socp_solver = cp.CLARABEL if hasattr(cp, "CLARABEL") else cp.ECOS
+        exhaustive = kwargs.get('exhaustive', False)
+        index_to_name = kwargs.get('index_to_name')
+
+        A_pts, mu_A, mu_B, n_A = base["A_pts"], base["mu_A"], base["mu_B"], base["n_A"]
+        free_idx, fixed_idx, E, k_free = base["free_idx"], base["fixed_idx"], base["E"], base["k_free"]
+        sparsity, lam, use_sparsity = base["sparsity"], base["lam"], base["use_sparsity"]
+        allowed_features, d = base["allowed_features"], base["d"]
+        n_base_competitors = len(base["competitor_nodes"])
+        B_node = base["B_node"]
+
+        # Apollonius data for the current DFS path: the base lists (built
+        # once above, never rebuilt) plus whichever sibling competitors are
+        # currently "on the stack" -- appended when descending into a child,
+        # popped when backtracking out of it (classic DFS backtracking, kept
+        # correct because each recursion level appends to, and later pops
+        # from, exactly one of these three lists -- see _add_competitor_apollonius).
+        convex_ball_in = list(base["convex_ball_in"])
+        convex_half = list(base["convex_half"])
+        rev_balls = list(base["rev_balls"])
+
+        results = []
+        solve_count = 0
+
+        def solve_here(n_extra):
+            nonlocal solve_count
+            solve_count += 1
+            return self._solve_ward_core(
+                A_pts, mu_A, mu_B, E, free_idx, fixed_idx, k_free,
+                convex_ball_in, convex_half, rev_balls,
+                sparsity, lam, use_sparsity, allowed_features,
+                n_base_competitors + n_extra, d, socp_solver, exhaustive, index_to_name)
+
+        def new_constraint_satisfied(kind, idx, p, tol=1e-6):
+            # Feasibility test for exactly the ONE newly-accumulated sibling
+            # constraint (O(1)), mirroring utilityFunctions.feasible's
+            # per-constraint predicate/tolerance for the matching kind.
+            if kind == "ball_in":
+                kappa, R = convex_ball_in[idx]
+                return np.linalg.norm(p - kappa) <= R + tol
+            if kind == "half":
+                a, b = convex_half[idx]
+                return a @ p <= b + tol
+            kappa, R = rev_balls[idx]["kappa"], rev_balls[idx]["R"]
+            return np.linalg.norm(p - kappa) >= R - tol
+
+        def pop_entry(kind):
+            if kind == "ball_in":
+                convex_ball_in.pop()
+            elif kind == "half":
+                convex_half.pop()
+            else:
+                rev_balls.pop()
+
+        def visit(node, depth, path, n_extra, parent_t, parent_optimal, new_entry):
+            if new_entry is None:
+                # Root: no parent solution to test/reuse, must solve.
+                A_prime, info = solve_here(n_extra)
+            else:
+                kind, idx = new_entry
+                p_parent = mu_A + parent_t
+                # Descending adds exactly one new competitor, which only
+                # shrinks the feasible region (objective unchanged) -- if the
+                # parent's (provably optimal) t still satisfies this one new
+                # constraint, it remains the min-norm point of the smaller
+                # region, so it is still exactly optimal for this node too.
+                if parent_optimal and new_constraint_satisfied(kind, idx, p_parent):
+                    t = parent_t
+                    p = p_parent
+                    info = ward_info(t, True, True, n_base_competitors + n_extra,
+                                      active(p, rev_balls, index_to_name), "inherited-parent")
+                    info["sparsity"] = sparsity
+                    info["lam"] = lam if sparsity else 0.0
+                    info["allowed_features"] = (None if allowed_features is None
+                                                 else np.asarray(allowed_features).tolist())
+                    A_prime = A_pts + t
+                else:
+                    A_prime, info = solve_here(n_extra)
+
+            results.append({
+                "target_node": node,
+                "path": list(path),
+                "A_prime": A_prime,
+                "info": info,
+                "depth": depth,
+            })
+
+            if not info.get("feasible", False):
+                # Nested feasible regions shrink with depth: F_0 superset
+                # F_1 superset ... , so an infeasible node makes every
+                # descendant on this path infeasible too. Do not descend.
+                return
+            if max_depth is not None and depth >= max_depth:
+                return
+
+            children = get_children(self.Z, self.n, node)
+            if children is None:
+                # Leaf of B's subtree: nothing left to specialize into.
+                return
+
+            c_left, c_right = children
+            left_leaves = self.get_leaves(c_left)
+            right_leaves = self.get_leaves(c_right)
+            t_here, optimal_here = info["t"], info.get("optimal", False)
+
+            def descend(child, child_leaves, sibling_node, sibling_leaves, path_pair):
+                # Sibling-preference constraint: d(A, child) < d(A, sibling),
+                # built with child's OWN centroid/weight as "near" (not B's)
+                # -- see diverseCounterfactuals' docstring for why this,
+                # rather than framing the sibling as a competitor against B,
+                # is what actually forces the split.
+                mu_child = np.asarray(self.X[child_leaves], dtype=float).mean(axis=0)
+                n_child = len(child_leaves)
+                w_child = 2.0 * n_A * n_child / (n_A + n_child)
+                kind, idx = self._add_competitor_apollonius(
+                    sibling_node, sibling_leaves, mu_A, mu_child, n_A, w_child,
+                    convex_ball_in, convex_half, rev_balls)
+                try:
+                    visit(child, depth + 1, path + [path_pair], n_extra + 1,
+                          t_here, optimal_here, (kind, idx))
+                finally:
+                    pop_entry(kind)
+
+            if both_children:
+                descend(c_left, left_leaves, c_right, right_leaves, (c_left, c_right))
+                descend(c_right, right_leaves, c_left, left_leaves, (c_right, c_left))
+            else:
+                mu_A_prime = np.asarray(A_prime, dtype=float).mean(axis=0)
+                d_left = np.linalg.norm(mu_A_prime - np.asarray(self.X[left_leaves], dtype=float).mean(axis=0))
+                d_right = np.linalg.norm(mu_A_prime - np.asarray(self.X[right_leaves], dtype=float).mean(axis=0))
+                # Descend only into the child the current solution is NOT
+                # already closer to, to avoid a redundant near-duplicate.
+                if d_left <= d_right:
+                    descend(c_right, right_leaves, c_left, left_leaves, (c_right, c_left))
+                else:
+                    descend(c_left, left_leaves, c_right, right_leaves, (c_left, c_right))
+
+        visit(B_node, 0, [], 0, None, False, None)
+        return results
 
     def counterfactual_complete_linkage_branch(self, B_leaves, A_leaves,
                                             metric='euclidean', anchor='min',
@@ -746,6 +1071,14 @@ class hiceCounterfactuals:
             if leaf_set <= A_set or leaf_set <= B_set:
                 continue
             competitor_nodes[node_id] = leaves
+
+        # Always add A's own unmoved position as a competitor: a counterfactual
+        # that leaves A exactly where it already was is not a real
+        # counterfactual, even if A happens to already dominate every live
+        # structural competitor (e.g. when A is the sibling of the branch the
+        # last query moved). This never removes a solution that genuinely
+        # requires movement — it only rules out the degenerate t=0 answer.
+        competitor_nodes["__A_unmoved__"] = A_leaves_sorted
 
         #print(f"Branch A                  : {_label(A_leaves_sorted)} (n_A={n_A}, step s_A={s_A})")
         #print(f"Branch B (target)         : {_label(B_leaves_sorted)} (n_B={n_B}, step s_B={s_B})")

@@ -70,6 +70,11 @@ from modules.baycon import run_baycon_baseline
 
 SPARSITY_MODES = ['l2', 'l1', 'adaptive', 'baycon_mask']
 
+# Revalidation numerical tolerance -- see runHierarchical.py's REVALIDATION_TOL
+# for why: absorbs solver floating-point ties (~1e-11) at near-zero optimal
+# displacement without weakening the actual validity definition.
+REVALIDATION_TOL = 1e-9
+
 FIELDNAMES = [
     'dataset', 'linkage', 'metric', 'pair_idx', 'sparsity_mode',
     'base_seed', 'call_seed', 'lam',
@@ -248,7 +253,8 @@ def run(in_csv, out_csv, min_leaf, max_leaf, max_pairs, timeout=300, eps=0.0,
                         secs = time.perf_counter() - t0
                         err = f"{type(e).__name__}: {e}"
 
-                    valid = validity(A_prime, B_pts, comp_pts, 'ward', metric, eps=eps)
+                    valid = validity(A_prime, B_pts, comp_pts, 'ward', metric,
+                                      eps=eps - REVALIDATION_TOL, A_orig=A_pts)
                     prox = proximity(info if isinstance(info, dict) else {}, A_pts, A_prime, metric)
                     spars = sparsity(prox['n_feat'], X.shape[1])
 

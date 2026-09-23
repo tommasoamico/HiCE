@@ -58,37 +58,13 @@ Usage:
 
 import argparse
 import os
-
+from modules.constants import PALETTE, TEXT_PRIMARY, TEXT_SECONDARY, GRID_COLOR, METHOD_ORDER, METHOD_LABEL, EXTRA_COLORS
 import autorank
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Validated categorical palette (see dataviz skill, references/palette.md).
-# Fixed hue order, assigned by method identity (not by rank/performance).
-PALETTE = {
-    "method": "#2a78d6",    # blue
-    "baseline": "#eb6834",  # orange
-    "baseline2": "#e34948", # red
-    "dice": "#1baf7a",      # aqua
-    "baycon": "#eda100",    # yellow
-}
-TEXT_PRIMARY = "#0b0b0b"
-TEXT_SECONDARY = "#52514e"
-GRID_COLOR = "#e3e2dc"
 
-METHOD_ORDER = ["method", "baseline", "baseline2", "dice", "baycon"]
-METHOD_LABEL = {
-    "method": "HiCE",
-    "baseline": "Baseline",
-    "baseline2": "Baseline 2",
-    "dice": "DiCE",
-    "baycon": "BayCon",
-}
-
-# Colors handed out (in order) to methods not covered by PALETTE above --
-# e.g. per-sparsity-mode HiCE variants coming from runHiceSparsity.py.
-EXTRA_COLORS = ["#8456ce", "#4a3aa7", "#c14fa5", "#0b8fa3", "#8a8f00", "#c96f1e"]
 
 
 def _load_and_normalize(csv_path):

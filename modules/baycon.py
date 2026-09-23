@@ -40,6 +40,7 @@ Key design choices (mirrors dice.py):
 import random
 
 import numpy as np
+from joblib import parallel_backend
 
 import baycon.baycon.bayesian_generator as baycon_gen
 from baycon.common.DataAnalyzer import DataAnalyzer
@@ -179,3 +180,105 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
         "n_cfs_returned": n_ret,
         "method": "baycon",
     }
+
+
+def run_baycon_baseline_multi(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
+                               k=10, eps=0.0, t_bound=5.0, n_train=400, seed=0):
+    """
+    Diversity variant of run_baycon_baseline: runs BayCon's search ONCE (same
+    setup as run_baycon_baseline) and, unlike the single-CF version, does NOT
+    collapse the accumulated candidate pool down to the single closest CF.
+    Instead it exact-rechecks every candidate BayCon's search ever generated
+    (`counterfactuals`, already >= MINIMUM_COUNTERFACTUALS_SIZE=10 when the
+    search succeeds) and returns TWO independently-selected k-sized subsets
+    of the valid ones, treated as two separate methods for comparison:
+
+      - "random"   : k valid candidates chosen uniformly at random (seeded).
+      - "proximal" : the k valid candidates with the smallest L2 norm
+                     (BayCon's own closest-to-query candidates).
+
+    Returns
+    -------
+    dict with keys "random" and "proximal", each a list of (A_prime, info)
+    tuples of length <= k (0 if BayCon found nothing valid). info dicts have
+    the same shape as run_baycon_baseline's: t, feasible (always True here),
+    distance_moved, found (always True), n_cfs_returned (BayCon's raw
+    candidate-pool size before the validity filter), method.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    A_pts = np.asarray(A_pts, float)
+    B_pts = np.asarray(B_pts, float)
+    X_all = np.asarray(X_all, float)
+    d = A_pts.shape[1]
+    if mu_A is None:
+        mu_A = A_pts.mean(axis=0)
+    mu_B = B_pts.mean(axis=0)
+
+    clf = ConstraintClassifier(A_pts, B_pts, comp_pts, linkage, eps=eps)
+
+    if linkage == 'ward':
+        t_seed = mu_B - mu_A                      # always Ward-feasible
+    elif linkage == 'complete':
+        raise NotImplementedError(
+            "Complete-linkage BayCon seed not implemented: mu_B is not guaranteed "
+            "feasible under complete linkage. Seed with the min-max/MEB baseline "
+            "translation instead (handled separately).")
+    else:
+        raise ValueError(f"Unsupported linkage {linkage!r}.")
+
+    T_pool = np.vstack([X_all - mu_A, t_seed[None, :], np.zeros((1, d))])
+    y_pool = clf.predict(T_pool)
+
+    if len(set(y_pool.tolist())) < 2:
+        rng = np.random.default_rng(seed)
+        T_box = rng.uniform(-t_bound, t_bound, size=(n_train, d))
+        T_pool = np.vstack([T_pool, T_box])
+        y_pool = clf.predict(T_pool)
+
+    feature_names = np.array([f"t{j}" for j in range(d)])
+    target = Target(target_type="classification", target_feature="valid", target_value=1)
+    data_analyzer = DataAnalyzer(T_pool, y_pool, feature_names, target)
+
+    initial_instance = np.zeros(d)
+    initial_prediction = 0
+
+    n_ret = 0
+    valid_ts = []
+    try:
+        # BayCon's internal RandomForestRegressor(n_jobs=-1) otherwise spins
+        # up a fresh loky process pool on every epoch's retrain; across
+        # hundreds of (pair, method) calls in a batch run those pools
+        # accumulate (observed leaked-semaphore warnings and OOM kills), so
+        # force the threading backend here -- no new processes, at some cost
+        # to RF-fit parallelism that doesn't matter for these small problems.
+        with parallel_backend('threading', n_jobs=1):
+            counterfactuals, _ = baycon_gen.run(
+                initial_instance, initial_prediction, target, data_analyzer, clf)
+        n_ret = len(counterfactuals)
+        if n_ret:
+            valid_ts = [t for t in counterfactuals if clf.predict([t])[0] == 1]
+    except Exception:
+        valid_ts = []
+
+    def _to_results(ts):
+        return [(A_pts + t, {
+            "t": t,
+            "feasible": True,
+            "distance_moved": float(np.linalg.norm(t)),
+            "found": True,
+            "n_cfs_returned": n_ret,
+            "method": "baycon",
+        }) for t in ts]
+
+    if not valid_ts:
+        return {"random": [], "proximal": []}
+
+    rng = np.random.default_rng(seed)
+    random_idx = rng.choice(len(valid_ts), size=min(k, len(valid_ts)), replace=False)
+    random_ts = [valid_ts[i] for i in random_idx]
+
+    proximal_ts = sorted(valid_ts, key=lambda t: np.linalg.norm(t))[:k]
+
+    return {"random": _to_results(random_ts), "proximal": _to_results(proximal_ts)}

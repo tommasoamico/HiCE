@@ -51,10 +51,16 @@ class ConstraintClassifier:
     Sklearn-style binary classifier over the rigid translation t (each input
     row is one candidate t of length d), exposing our domination test to DiCE.
 
-    predict(T)       -> array of {0,1}: 1 iff A + t dominates B vs all competitors.
+    predict(T)       -> array of {0,1}: 1 iff A + t dominates B vs all competitors
+                        AND vs A's own unmoved position (t=0 is never valid,
+                        and neither is any t that still leaves A effectively
+                        where it started -- matches metrics.validity's A_orig
+                        handling and HiCE's own solver, which always treats
+                        A's unmoved position as a competitor).
     predict_proba(T) -> array of [P(0), P(1)] with
                         P(1) = sigmoid(scale * margin),
-                        margin = min_X ( d(A+t, X) - d(A+t, B) ).
+                        margin = min_X ( d(A+t, X) - d(A+t, B) ), X ranging over
+                        comp_pts AND A's own original (unmoved) position.
                         margin > eps  <=>  valid, so P(1) > 0.5 there; the soft
                         value gives genetic DiCE a gradient of preference.
 
@@ -70,7 +76,10 @@ class ConstraintClassifier:
     def __init__(self, A_pts, B_pts, comp_pts, linkage, eps=0.0, scale=5.0):
         self.A = np.asarray(A_pts, float)
         self.B = np.asarray(B_pts, float)
-        self.comp = [np.asarray(c, float) for c in comp_pts]
+        # A's own unmoved position is always a competitor too, so t=0 (and
+        # anything that still leaves A effectively where it started) is never
+        # valid -- see class docstring.
+        self.comp = [np.asarray(c, float) for c in comp_pts] + [self.A]
         self.linkage = linkage
         self.eps = eps
         self.scale = scale
@@ -272,3 +281,96 @@ def run_dice_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
         "n_cfs_returned": n_ret,
         "method": "dice-genetic",
     }
+
+
+def run_dice_baseline_multi(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
+                             k=10, eps=0.0, t_bound=5.0, n_train=400, seed=0,
+                             verbose=False):
+    """
+    Diversity variant of run_dice_baseline: asks DiCE for exactly k
+    counterfactuals (total_CFs=k) -- DiCE's genetic search already optimizes
+    for diversity among the CFs it returns, so no extra selection is layered
+    on top here. Every returned row is exact-rechecked against our validity
+    test; only the valid ones are kept, in the order DiCE returned them
+    (first-k, not re-ranked by proximity).
+
+    Same setup (classifier, training frame, guaranteed-valid seed) as
+    run_dice_baseline; see its docstring for details.
+
+    Returns
+    -------
+    results : list of (A_prime, info) tuples, length <= k (possibly 0 if
+        DiCE returned nothing valid). Each info dict has the same shape as
+        run_dice_baseline's: t, feasible (always True here), distance_moved,
+        found (always True), n_cfs_returned (DiCE's raw row count before the
+        validity filter), method.
+    """
+    from dice_ml import Dice, Data, Model
+
+    # see run_dice_baseline: DiCE's genetic search draws from the GLOBAL
+    # numpy/python random state, so reseed here for standalone reproducibility.
+    random.seed(seed)
+    np.random.seed(seed)
+
+    A_pts = np.asarray(A_pts, float)
+    B_pts = np.asarray(B_pts, float)
+    X_all = np.asarray(X_all, float)
+    d = A_pts.shape[1]
+    if mu_A is None:
+        mu_A = A_pts.mean(axis=0)
+    mu_B = B_pts.mean(axis=0)
+
+    clf = ConstraintClassifier(A_pts, B_pts, comp_pts, linkage, eps=eps)
+
+    if linkage == 'ward':
+        t_seed = mu_B - mu_A                      # always Ward-feasible
+    elif linkage == 'complete':
+        raise NotImplementedError(
+            "Complete-linkage DiCE seed not implemented: mu_B is not guaranteed "
+            "feasible under complete linkage. Seed with the min-max/MEB baseline "
+            "translation instead (handled separately).")
+    else:
+        raise ValueError(f"Unsupported linkage {linkage!r}.")
+
+    T_frame = np.vstack([X_all - mu_A, t_seed[None, :]])
+    y = clf.predict(T_frame)
+
+    if len(set(y.tolist())) < 2:
+        rng = np.random.default_rng(seed)
+        T_box = rng.uniform(-t_bound, t_bound, size=(n_train, d))
+        T_frame = np.vstack([T_frame, T_box])
+        y = clf.predict(T_frame)
+
+    cols = [f"t{j}" for j in range(d)]
+    df = pd.DataFrame(T_frame, columns=cols)
+    df["valid"] = y
+
+    data = Data(dataframe=df, continuous_features=cols, outcome_name="valid")
+    model = Model(model=clf, backend="sklearn", model_type="classifier")
+    exp = Dice(data, model, method="genetic")
+
+    q = pd.DataFrame([{c: 0.0 for c in cols}])
+    n_ret = 0
+    valid_ts = []
+    try:
+        res = exp.generate_counterfactuals(
+            q, total_CFs=k, desired_class=1, verbose=verbose)
+        cf = res.cf_examples_list[0].final_cfs_df
+        if cf is not None and len(cf) > 0:
+            T = cf[cols].to_numpy(float)
+            n_ret = len(T)
+            valid_ts = [t for t in T if clf.predict([t])[0] == 1]
+    except Exception:
+        valid_ts = []
+
+    results = []
+    for t in valid_ts[:k]:
+        results.append((A_pts + t, {
+            "t": t,
+            "feasible": True,
+            "distance_moved": float(np.linalg.norm(t)),
+            "found": True,
+            "n_cfs_returned": n_ret,
+            "method": "dice-genetic",
+        }))
+    return results

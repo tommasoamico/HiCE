@@ -244,8 +244,19 @@ def counterfactual_complete_linkage_discrete(x_idx, target_leaf_indices, X, Z, i
 def unit(d, rng):
     u = rng.standard_normal(d)
     return u / (np.linalg.norm(u) + 1e-12)
- 
- 
+
+
+def get_children(Z, n, node_id):
+    """
+    Return (left, right) child node ids of an internal node, or None if
+    node_id is a leaf (< n) and therefore has no children.
+    """
+    if node_id < n:
+        return None
+    left, right = int(Z[node_id - n, 0]), int(Z[node_id - n, 1])
+    return left, right
+
+
 def feasible(p, convex_ball_in, convex_half, rev_balls, tol=1e-6):
     for (kappa, R) in convex_ball_in:
         if np.linalg.norm(p - kappa) > R + tol:
