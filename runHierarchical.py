@@ -65,7 +65,9 @@ from modules.utilityFunctions import (
     MethodTimeout, _prepare_out_csv, time_limit,
     call_seed, _seed_everything, load_openml,
 )
-from modules.metrics import validity, proximity, tree_coverage, tree_coverage_from_targets
+from modules.metrics import (
+    validity, proximity, tree_coverage, tree_coverage_from_targets, is_degenerate_tie,
+)
 from modules.dice import run_dice_baseline_multi
 from modules.baycon import run_baycon_baseline_multi
 from visualizations import _build_style, _style_axes
@@ -156,18 +158,37 @@ def _cf_list_stats(cf_results, A_pts, B_pts, comp_pts, metric, Z, n_leaves, B_no
     but not for this exact check, which already knows the intended side.
     Methods without that metadata (DiCE, BayCon) fall back to
     tree_coverage's Ward-weighted geometric routing.
+
+    Every invalid CF is additionally checked against
+    metrics.is_degenerate_tie: a margin of violation small enough that it's
+    plausibly the solver converging to an unattainable strict-domination
+    boundary (e.g. a duplicate-of-B competitor) rather than a real mistake
+    -- see that function and the hiceSparsityCoverage breast-w
+    investigation it came from. The count is surfaced (n_degenerate_ties)
+    rather than silently folded into "invalid", so a run can be audited for
+    how much of its shortfall from 100% validity is this known, largely
+    harmless edge case vs. something else; a nonzero count is also printed
+    live so it's visible during a run, not just after the fact.
     """
     per_cf = []
     valid_ts = []
     valid_centroids = []
     valid_target_nodes = []
     has_target_info = False
+    n_degenerate_ties = 0
     for A_prime, info in cf_results:
         info = info if isinstance(info, dict) else {}
         if 'target_node' in info:
             has_target_info = True
-        ok = validity(A_prime, B_pts, comp_pts, LINKAGE, metric,
-                      eps=-REVALIDATION_TOL, A_orig=A_pts)
+        ok, margin = validity(A_prime, B_pts, comp_pts, LINKAGE, metric,
+                               eps=-REVALIDATION_TOL, A_orig=A_pts,
+                               return_margin=True)
+        if not ok and is_degenerate_tie(margin):
+            n_degenerate_ties += 1
+            print(f"[warn] degenerate tie: invalid CF for target_node="
+                  f"{info.get('target_node')} with margin={margin:.3e} "
+                  f"(solver feasible={info.get('feasible')}) -- see "
+                  f"metrics.is_degenerate_tie", flush=True)
         prox = proximity(info, A_pts, A_prime, metric)
         per_cf.append((bool(ok), prox['l2']))
         if ok:
@@ -192,6 +213,7 @@ def _cf_list_stats(cf_results, A_pts, B_pts, comp_pts, metric, Z, n_leaves, B_no
 
     if n_valid == 0:
         return dict(n_returned=n_returned, n_valid=0,
+                    n_degenerate_ties=n_degenerate_ties,
                     avg_proximity=np.nan, avg_pairwise_distance=np.nan,
                     n_subbranches=n_sub, n_subbranches_represented=n_repr,
                     tree_coverage=tc, tree_coverage_norm=tc_norm, per_cf=per_cf)
@@ -204,6 +226,7 @@ def _cf_list_stats(cf_results, A_pts, B_pts, comp_pts, metric, Z, n_leaves, B_no
     else:
         avg_pairwise_distance = np.nan
     return dict(n_returned=n_returned, n_valid=n_valid,
+                n_degenerate_ties=n_degenerate_ties,
                 avg_proximity=avg_proximity,
                 avg_pairwise_distance=avg_pairwise_distance,
                 n_subbranches=n_sub, n_subbranches_represented=n_repr,
@@ -356,7 +379,7 @@ def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
                 cseed = per_method_seed[which]
                 stats = _cf_list_stats(cfs, A_pts, B_pts, comp_pts, metric,
                                         Z, cf.n, B_node, X) if not err else \
-                    dict(n_returned=0, n_valid=0, avg_proximity=np.nan,
+                    dict(n_returned=0, n_valid=0, n_degenerate_ties=0, avg_proximity=np.nan,
                          avg_pairwise_distance=np.nan,
                          n_subbranches=np.nan, n_subbranches_represented=np.nan,
                          tree_coverage=np.nan, tree_coverage_norm=np.nan, per_cf=[])
@@ -369,6 +392,7 @@ def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
                     pair_idx=idx, which=which, base_seed=seed, call_seed=cseed,
                     n_A=len(A_lv), n_B=len(B_lv),
                     k_requested=k, n_returned=stats['n_returned'], n_valid=stats['n_valid'],
+                    n_degenerate_ties=stats['n_degenerate_ties'],
                     scale=scale, avg_proximity=stats['avg_proximity'],
                     avg_pairwise_distance=stats['avg_pairwise_distance'],
                     avg_proximity_norm=prox_norm, avg_pairwise_distance_norm=pair_norm,
@@ -455,8 +479,17 @@ def plot_coverage_curve(df, out_path, order, labels, colors, metric_col,
     (pairs with a defined metric_col) / (all pairs) -- its coverage rate,
     shown in the legend -- so a method that fails to produce a usable value
     for many pairs (e.g. low-validity BayCon variants) visibly stops early.
+
+    The universe of "all pairs" is distinct (dataset, pair_idx) pairs when
+    `df` spans more than one dataset (e.g. a pooled cross-dataset call),
+    since pair_idx is only unique WITHIN a dataset -- using plain
+    pair_idx.nunique() there would undercount the universe and let
+    coverage rates run past 100%.
     """
-    n_universe = df["pair_idx"].nunique()
+    if "dataset" in df.columns and df["dataset"].nunique() > 1:
+        n_universe = len(df[["dataset", "pair_idx"]].drop_duplicates())
+    else:
+        n_universe = df["pair_idx"].nunique()
     fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
     for which in order:
         sub = df[df["which"] == which]
@@ -565,6 +598,52 @@ def plot_diversity_validity_diversity(df, out_path, order, labels, colors,
         title=title)
 
 
+def plot_tree_coverage(df, out_path, order, labels, colors,
+                        metric_col="tree_coverage",
+                        title="Tree coverage by method"):
+    """
+    Bar chart of mean tree_coverage (fraction of B's sub-branches
+    represented by at least one returned counterfactual) per method, with
+    +/- 1 std across pairs as an error bar. Unlike the proximity/diversity
+    coverage curves, tree coverage isn't ranked by "closeness" -- it's a
+    per-pair fraction in [0, 1] regardless of how proximal the CFs that
+    earned it are -- so it's shown on its own as a plain per-method
+    summary rather than against a most-proximal/most-diverse x-axis. A pair
+    where B is a single leaf (no sub-branches to cover) has an undefined
+    (NaN) tree_coverage and is dropped from the mean, same as a method
+    that returned no valid CFs for a pair.
+    """
+    methods = [m for m in order if m in df["which"].unique()]
+
+    bar_labels, means, stds, bar_colors, ns = [], [], [], [], []
+    for m in methods:
+        vals = df.loc[df["which"] == m, metric_col].dropna()
+        if len(vals) == 0:
+            continue
+        bar_labels.append(labels.get(m, m))
+        means.append(vals.mean() * 100)
+        stds.append(vals.std() * 100 if len(vals) > 1 else 0)
+        bar_colors.append(colors.get(m, "#4a3aa7"))
+        ns.append(len(vals))
+
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+    x = np.arange(len(bar_labels))
+    ax.bar(x, means, yerr=stds, color=bar_colors, width=0.6,
+           capsize=4, error_kw=dict(ecolor="#52514e", linewidth=1.2))
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{lbl}\n(n={n})" for lbl, n in zip(bar_labels, ns)])
+    ax.set_ylabel("Mean tree coverage (% of B's sub-branches represented)")
+    ax.set_title(title, color="#0b0b0b", fontsize=13, pad=12)
+    ax.set_ylim(bottom=0)
+    _style_axes(ax)
+    ax.xaxis.grid(False)
+    fig.tight_layout()
+    fig.savefig(out_path, facecolor="white")
+    plt.close(fig)
+    print(f"[plot] wrote {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dataset', type=str, nargs='+', default=['iris'],
@@ -577,7 +656,7 @@ def main():
     ap.add_argument('--max-pairs', type=int, default=100)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--eps', type=float, default=0.0)
-    ap.add_argument('--timeout', type=float, default=300,
+    ap.add_argument('--timeout', type=float, default=600,
                      help="per-call wall-clock limit in seconds (0/negative disables)")
     ap.add_argument('--no-plot', action='store_true')
     a = ap.parse_args()

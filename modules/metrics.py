@@ -3,7 +3,8 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 
-def validity(A_prime, B_pts, comp_pts, linkage, metric, eps=0.0, A_orig=None):
+def validity(A_prime, B_pts, comp_pts, linkage, metric, eps=0.0, A_orig=None,
+             return_margin=False):
     """
     Reuse the class's _dominates for euclidean; hamming handled explicitly.
 
@@ -14,9 +15,15 @@ def validity(A_prime, B_pts, comp_pts, linkage, metric, eps=0.0, A_orig=None):
     would count as valid as long as it edges out the real competitors --
     matching HiCE's own solver, which always treats A's unmoved position as
     a competitor (see hiceCounterfactuals._build_ward_geometry).
+
+    return_margin=True additionally returns the tightest competitor's slack
+    (see _dominates' docstring / is_degenerate_tie below): positive means
+    valid with that much room, non-positive means invalid, and a tiny
+    negative value right at the tolerance boundary flags a near-tie rather
+    than a clear violation.
     """
     if A_prime is None:
-        return False
+        return (False, np.nan) if return_margin else False
     A_prime = np.asarray(A_prime)
     competitors = list(comp_pts) + ([A_orig] if A_orig is not None else [])
     if metric == 'hamming':
@@ -24,10 +31,35 @@ def validity(A_prime, B_pts, comp_pts, linkage, metric, eps=0.0, A_orig=None):
         def hmax(P, Q):
             return cdist(P.astype(float), Q.astype(float), metric='hamming').max() * d
         dB = hmax(A_prime, B_pts)
-        return all(dB < hmax(A_prime, np.asarray(Xp)) - eps for Xp in competitors)
+        margins = [(hmax(A_prime, np.asarray(Xp)) - eps) - dB for Xp in competitors]
+        margin = min(margins) if margins else np.inf
+        ok = margin > 0
+        return (ok, margin) if return_margin else ok
     # euclidean -> your predicate (complete uses max, ward uses weighted centroid)
     return _dominates(A_prime, np.asarray(B_pts),
-                      [np.asarray(c) for c in competitors], linkage, eps)
+                      [np.asarray(c) for c in competitors], linkage, eps,
+                      return_margin=return_margin)
+
+
+# A margin violation this small is indistinguishable from the kind of exact
+# (or near-exact, e.g. duplicate-row) tie diagnosed in breast-w: the solver
+# converges to the true (unattainable) infimum of an open strict-domination
+# constraint and reports feasible/optimal, while revalidation's strict "<"
+# correctly rejects it. Empirically that tie showed up at a ~1e-7 absolute
+# violation (see hiceSparsityCoverage investigation); 1e-3 gives >3 orders
+# of magnitude of headroom above that while still being far below the scale
+# of a genuine, non-degenerate violation on normalized (unit-variance) data.
+DEGENERATE_TIE_TOL = 1e-3
+
+
+def is_degenerate_tie(margin):
+    """
+    True iff an invalid margin (<=0) is small enough to plausibly be a
+    numerically-degenerate tie rather than a real domination violation --
+    see DEGENERATE_TIE_TOL. NaN/inf margins (e.g. A_prime is None) are
+    never ties.
+    """
+    return bool(np.isfinite(margin) and -DEGENERATE_TIE_TOL < margin <= 0)
 
 
 def proximity(info, A_orig, A_prime, metric):

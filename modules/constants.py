@@ -46,7 +46,7 @@ DIVERSITY_RAW_FIELDNAMES = [
 ]
 DIVERSITY_SUMMARY_FIELDNAMES = [
     'dataset', 'linkage', 'metric', 'pair_idx', 'which', 'base_seed', 'call_seed',
-    'n_A', 'n_B', 'k_requested', 'n_returned', 'n_valid',
+    'n_A', 'n_B', 'k_requested', 'n_returned', 'n_valid', 'n_degenerate_ties',
     'scale', 'avg_proximity', 'avg_pairwise_distance',
     'avg_proximity_norm', 'avg_pairwise_distance_norm',
     'n_subbranches', 'n_subbranches_represented',

@@ -303,7 +303,7 @@ def distLinkage(P, Q, linkage):
 
 # we can reuse a lot of distances here instead of computing cdist every time, need to implement
 # it across the whole pipeline
-def _dominates(A_prime, B_pts, competitor_pts_list, linkage, eps):
+def _dominates(A_prime, B_pts, competitor_pts_list, linkage, eps, return_margin=False):
     """
     Validity predicate: does the moved branch A_prime dominate B i.e. is it
     strictly closer to B than to every competitor under the given linkage?
@@ -314,14 +314,23 @@ def _dominates(A_prime, B_pts, competitor_pts_list, linkage, eps):
     Returns True iff d(A_prime, B) < d(A_prime, X) - eps for every competitor X.
     The full competitor set is re-checked every call, because a revert can
     change which competitor is nearest.
+
+    return_margin=True additionally returns the tightest slack found,
+    margin = min_X [ (dX - eps) - dB ]  (competitor-side minus B-side):
+    positive means valid with that much room to spare, non-positive means
+    the (possibly only just) tightest competitor violates domination.
+    Diagnostic use: distinguishing a genuine violation from a numerically
+    degenerate near-tie (e.g. a competitor that duplicates B) needs this
+    margin, not just the boolean -- see metrics.validity's `tie_tol`.
     """
     if linkage == 'complete':
         dB = cdist(A_prime, B_pts, metric='euclidean').max()
+        margin = np.inf
         for Xp in competitor_pts_list:
             dX = cdist(A_prime, Xp, metric='euclidean').max()
-            if not (dB < dX - eps):
-                return False
-        return True
+            margin = min(margin, (dX - eps) - dB)
+        ok = margin > 0
+        return (ok, margin) if return_margin else ok
 
     elif linkage == 'ward':
         nA = len(A_prime)
@@ -331,12 +340,13 @@ def _dominates(A_prime, B_pts, competitor_pts_list, linkage, eps):
             nS = len(P)
             c = np.sqrt(2.0 * nA * nS / (nA + nS))
             return c * np.linalg.norm(muA - P.mean(axis=0))
-        
+
         dB = wd(B_pts)
+        margin = np.inf
         for Xp in competitor_pts_list:
-            if not (dB < wd(Xp) - eps):
-                return False
-        return True
+            margin = min(margin, (wd(Xp) - eps) - dB)
+        ok = margin > 0
+        return (ok, margin) if return_margin else ok
 
     else:
         raise ValueError(f"Unsupported linkage {linkage!r}; use 'complete' or 'ward'.")
@@ -538,6 +548,19 @@ def load_openml(name, linkage):
     target = ds.default_target_attribute
     Xdf, _, _, _ = ds.get_data(dataset_format="dataframe", target=target)
     Xdf = Xdf.dropna(axis=1, how='any')
+    # Exact-duplicate rows become distinct leaves with distance 0 between
+    # them. When one such duplicate sits inside a competitor branch, no
+    # displacement can make a moved A strictly closer to B than to that
+    # duplicate-of-B competitor: strict domination's infimum there is an
+    # unattainable tie, which HiCE's solver (only able to express the
+    # closed <= constraint) reports as feasible/optimal even though
+    # independent revalidation correctly rejects it. Collapsing duplicates
+    # to one row removes that degeneracy at the source.
+    n_before = len(Xdf)
+    Xdf = Xdf.drop_duplicates().reset_index(drop=True)
+    if len(Xdf) < n_before:
+        print(f"[data] '{name}': dropped {n_before - len(Xdf)} exact-duplicate "
+              f"row(s) ({n_before} -> {len(Xdf)})")
     metric, types = resolve_metric_and_validate(Xdf, linkage)
     if metric == 'euclidean':
         X = Xdf.to_numpy(dtype=float)

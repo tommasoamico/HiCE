@@ -324,7 +324,7 @@ def main():
     ap.add_argument('--lam', type=float, default=1.0,
                      help="L1 weight for sparsity_mode='l1' (mirrors runHierarchical's default)")
     ap.add_argument('--eps', type=float, default=0.0)
-    ap.add_argument('--timeout', type=float, default=300,
+    ap.add_argument('--timeout', type=float, default=600,
                      help="per-call wall-clock limit in seconds (0/negative disables)")
     a = ap.parse_args()
 
