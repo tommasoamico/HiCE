@@ -656,7 +656,7 @@ def main():
     ap.add_argument('--max-pairs', type=int, default=100)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--eps', type=float, default=0.0)
-    ap.add_argument('--timeout', type=float, default=600,
+    ap.add_argument('--timeout', type=float, default=1200,
                      help="per-call wall-clock limit in seconds (0/negative disables)")
     ap.add_argument('--no-plot', action='store_true')
     a = ap.parse_args()
