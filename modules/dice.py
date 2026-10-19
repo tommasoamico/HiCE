@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 from dice_ml import Dice, Data, Model
-from modules.utilityFunctions import distLinkage, wardDistance, complete_linkage_max
+from modules.utilityFunctions import distLinkage, wardDistance, complete_linkage_max, complete_linkage_meb_seed
 
 
 # ======================================================================
@@ -216,10 +216,14 @@ def run_dice_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     if linkage == 'ward':
         t_seed = mu_B - mu_A                      # always Ward-feasible
     elif linkage == 'complete':
-        raise NotImplementedError(
-            "Complete-linkage DiCE seed not implemented: mu_B is not guaranteed "
-            "feasible under complete linkage. Seed with the min-max/MEB baseline "
-            "translation instead (handled separately).")
+        # Complete linkage has no always-feasible analogue of Ward's mu_B seed,
+        # so use the min-max/MEB translation: the t minimising A's FARTHEST
+        # distance to B. That is the feasibility floor for d(A(t), B) -- the
+        # best shot any translation has -- but it ignores competitors, so it
+        # may itself be invalid. The search frame below is built from it either
+        # way and the one-class safety net handles the case where nothing valid
+        # turns up. See utilityFunctions.complete_linkage_meb_seed.
+        t_seed = complete_linkage_meb_seed(A_pts, B_pts)
     else:
         raise ValueError(f"Unsupported linkage {linkage!r}.")
  
@@ -325,10 +329,14 @@ def run_dice_baseline_multi(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     if linkage == 'ward':
         t_seed = mu_B - mu_A                      # always Ward-feasible
     elif linkage == 'complete':
-        raise NotImplementedError(
-            "Complete-linkage DiCE seed not implemented: mu_B is not guaranteed "
-            "feasible under complete linkage. Seed with the min-max/MEB baseline "
-            "translation instead (handled separately).")
+        # Complete linkage has no always-feasible analogue of Ward's mu_B seed,
+        # so use the min-max/MEB translation: the t minimising A's FARTHEST
+        # distance to B. That is the feasibility floor for d(A(t), B) -- the
+        # best shot any translation has -- but it ignores competitors, so it
+        # may itself be invalid. The search frame below is built from it either
+        # way and the one-class safety net handles the case where nothing valid
+        # turns up. See utilityFunctions.complete_linkage_meb_seed.
+        t_seed = complete_linkage_meb_seed(A_pts, B_pts)
     else:
         raise ValueError(f"Unsupported linkage {linkage!r}.")
 

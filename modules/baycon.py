@@ -46,6 +46,7 @@ import baycon.baycon.bayesian_generator as baycon_gen
 from baycon.common.DataAnalyzer import DataAnalyzer
 from baycon.common.Target import Target
 from modules.dice import ConstraintClassifier
+from modules.utilityFunctions import complete_linkage_meb_seed
 
 
 # ======================================================================
@@ -118,10 +119,14 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     if linkage == 'ward':
         t_seed = mu_B - mu_A                      # always Ward-feasible
     elif linkage == 'complete':
-        raise NotImplementedError(
-            "Complete-linkage BayCon seed not implemented: mu_B is not guaranteed "
-            "feasible under complete linkage. Seed with the min-max/MEB baseline "
-            "translation instead (handled separately).")
+        # Complete linkage has no always-feasible analogue of Ward's mu_B seed,
+        # so use the min-max/MEB translation: the t minimising A's FARTHEST
+        # distance to B. That is the feasibility floor for d(A(t), B) -- the
+        # best shot any translation has -- but it ignores competitors, so it
+        # may itself be invalid. The search pool below is built from it either
+        # way and the one-class safety net handles the case where nothing valid
+        # turns up. See utilityFunctions.complete_linkage_meb_seed.
+        t_seed = complete_linkage_meb_seed(A_pts, B_pts)
     else:
         raise ValueError(f"Unsupported linkage {linkage!r}.")
 
@@ -137,6 +142,25 @@ def run_baycon_baseline(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
         T_box = rng.uniform(-t_bound, t_bound, size=(n_train, d))
         T_pool = np.vstack([T_pool, T_box])
         y_pool = clf.predict(T_pool)
+
+    # If the pool is still single-class the search has nothing to learn from.
+    # Under Ward this cannot happen (t_seed is valid, t=0 is not), but under
+    # complete linkage the MEB seed carries no feasibility guarantee, so a pair
+    # whose counterfactual region is genuinely empty lands here. Return "found
+    # nothing" rather than letting DataAnalyzer/the RF fit raise on one class:
+    # an empty result is the honest outcome and is what the callers already
+    # handle, whereas an exception here would escape the generation try/except
+    # below (DataAnalyzer is constructed outside it).
+    if len(set(y_pool.tolist())) < 2:
+        return None, {
+            "t": np.zeros(d),
+            "feasible": False,
+            "distance_moved": float("nan"),
+            "found": False,
+            "n_cfs_returned": 0,
+            "method": "baycon",
+            "one_class_pool": True,
+        }
 
     feature_names = np.array([f"t{j}" for j in range(d)])
     target = Target(target_type="classification", target_feature="valid", target_value=1)
@@ -221,10 +245,14 @@ def run_baycon_baseline_multi(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
     if linkage == 'ward':
         t_seed = mu_B - mu_A                      # always Ward-feasible
     elif linkage == 'complete':
-        raise NotImplementedError(
-            "Complete-linkage BayCon seed not implemented: mu_B is not guaranteed "
-            "feasible under complete linkage. Seed with the min-max/MEB baseline "
-            "translation instead (handled separately).")
+        # Complete linkage has no always-feasible analogue of Ward's mu_B seed,
+        # so use the min-max/MEB translation: the t minimising A's FARTHEST
+        # distance to B. That is the feasibility floor for d(A(t), B) -- the
+        # best shot any translation has -- but it ignores competitors, so it
+        # may itself be invalid. The search pool below is built from it either
+        # way and the one-class safety net handles the case where nothing valid
+        # turns up. See utilityFunctions.complete_linkage_meb_seed.
+        t_seed = complete_linkage_meb_seed(A_pts, B_pts)
     else:
         raise ValueError(f"Unsupported linkage {linkage!r}.")
 
@@ -236,6 +264,17 @@ def run_baycon_baseline_multi(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
         T_box = rng.uniform(-t_bound, t_bound, size=(n_train, d))
         T_pool = np.vstack([T_pool, T_box])
         y_pool = clf.predict(T_pool)
+
+    # If the pool is still single-class the search has nothing to learn from.
+    # Under Ward this cannot happen (t_seed is valid, t=0 is not), but under
+    # complete linkage the MEB seed carries no feasibility guarantee, so a pair
+    # whose counterfactual region is genuinely empty lands here. Return "found
+    # nothing" rather than letting DataAnalyzer/the RF fit raise on one class:
+    # an empty result is the honest outcome and is what the callers already
+    # handle, whereas an exception here would escape the generation try/except
+    # below (DataAnalyzer is constructed outside it).
+    if len(set(y_pool.tolist())) < 2:
+        return {"random": [], "proximal": []}
 
     feature_names = np.array([f"t{j}" for j in range(d)])
     target = Target(target_type="classification", target_feature="valid", target_value=1)

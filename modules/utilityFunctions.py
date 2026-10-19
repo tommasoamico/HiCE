@@ -55,6 +55,38 @@ def detect_column_types(df, max_cardinality_ratio=0.05, max_unique_categorical=2
 # In small dimesnion it would be more convenient computing the convex hull
 # In high dimesnion, can use random projections acceoting a (1+epsilon) error or prune
 # now we leave it like this, candidate for optimisation
+def complete_linkage_meb_seed(A_pts, B_pts):
+    """
+    Min-max (MEB) translation seed for complete linkage: the t that minimises
+    A's FARTHEST distance to B, which is the natural complete-linkage analogue
+    of Ward's mu_B - mu_A seed.
+
+        t* = argmin_t max_{a in A, b in B} ||a + t - b||
+           = -center( minimum enclosing ball of V_AB = {a - b} )
+
+    (max_{a,b} ||a - b + t|| is the radius of the ball centred at -t that
+    encloses V_AB, so minimising it means centring that ball on the MEB.)
+
+    IMPORTANT -- unlike Ward's seed, this is NOT guaranteed to be a valid
+    counterfactual. Under Ward, moving A's centroid onto mu_B always dominates
+    every competitor, so mu_B - mu_A is always feasible. Under complete linkage
+    no such translation exists in general: this t minimises d(A(t), B) while
+    ignoring competitors entirely, so d(A(t), B) is the feasibility FLOOR but a
+    competitor may still be closer. It is therefore the best available starting
+    point -- if even this t cannot dominate, A's own min-max position loses --
+    but callers must treat it as a candidate, not a certificate, and cope with
+    a search frame that comes back single-class. See
+    hiceCounterfactuals.baselineCompleteLinkage, which uses the same
+    construction as a standalone baseline.
+    """
+    import miniball
+    A_pts = np.asarray(A_pts, dtype=float)
+    B_pts = np.asarray(B_pts, dtype=float)
+    V = np.array([a - b for a in A_pts for b in B_pts], dtype=float)
+    C, _r2 = miniball.get_bounding_ball(V)
+    return -np.asarray(C, dtype=float)
+
+
 def complete_linkage_max(P_pts, Q_pts, metric_):
         return cdist(P_pts, Q_pts, metric=metric_).max() 
 
