@@ -83,12 +83,62 @@ from modules.baycon import run_baycon_baseline_multi
 
 WHICH_LIST = ['method', 'baseline', 'dice', 'baycon']
 
+# DiCE and BayCon are run for EUCLIDEAN complete linkage only.
+#
+# Both search over a rigid translation t, and under Euclidean complete
+# linkage that is the right move space: d(A(t), S) = max_{a,s} ||a + t - s||
+# is fully determined by t, so optimising a vector is exactly the problem
+# (verified: they return independently-revalidated counterfactuals there).
+#
+# Under HAMMING it is not. The admissible move is a per-coordinate
+# RELABELING f_j applied to all of A, which is not a point in feature space,
+# so there is nothing for a point-optimising search to translate. Worse, our
+# ConstraintClassifier would score such a search with Euclidean geometry
+# regardless: distLinkage hardcodes metric_='euclidean' for 'complete'. Left
+# enabled, they return fractional "codes" that are not valid categorical
+# assignments at all, yet can pass a numeric domination check -- on
+# hayes-roth that produced valid=True rows with EVERY cell changed, which
+# would be a silently wrong baseline rather than a missing one.
+#
+# Both libraries do support categorical features natively (dice_ml via
+# Data(continuous_features=...), BayCon via DataAnalyzer(cat_features=...));
+# our wrappers simply declare every column continuous. Making them genuine
+# Hamming baselines therefore means changing the SEARCH VARIABLE to the
+# relabeling itself (one categorical variable per (coordinate, source value)
+# with domain = that coordinate's A u B values) and giving
+# ConstraintClassifier a Hamming branch -- deliberately out of scope here,
+# so these rows are recorded as not-applicable instead of fabricated.
+EUCLIDEAN_ONLY = {'dice', 'baycon'}
+NA_HAMMING = ("NotApplicable: searches a rigid translation, which is not the "
+              "Hamming relabeling move space -- see runCompleteLinkage."
+              "EUCLIDEAN_ONLY")
+
 # Revalidation tolerance, same rationale as runHierarchical.REVALIDATION_TOL:
 # passed as a NEGATIVE eps so validity's `dB < dX - eps` test relaxes to
 # `dB < dX + tol`, absorbing solver rounding at ~1e-11 without weakening the
 # definition. It matters more here than under Ward, because this solver's own
 # eps is a margin on SQUARED distances while validity compares UNSQUARED ones.
 REVALIDATION_TOL = 1e-9
+
+
+def _reval_eps(metric):
+    """
+    Revalidation eps, as a NEGATIVE value to relax validity's `dB < dX - eps`.
+
+    Euclidean: -REVALIDATION_TOL, absorbing solver rounding noise.
+
+    Hamming: EXACTLY 0. Hamming distances are integers, so there is no
+    rounding noise to absorb -- and applying the Euclidean tolerance there
+    silently turns strict domination into NON-strict, because `dB < dX + 1e-9`
+    is just `dB <= dX` on integers. Ties are common on small alphabets
+    (observed on hayes-roth: d_H(A',B) equal to the nearest competitor on
+    every pair tested, margin exactly 0), so the tolerance would mark a tie
+    as valid and systematically overstate validity for every method on
+    categorical data -- while the exact solver, which correctly requires
+    STRICT domination, reported those same pairs infeasible. That mismatch
+    looked like a solver bug and was not.
+    """
+    return 0.0 if metric == 'hamming' else -REVALIDATION_TOL
 
 
 def _build_tree(X, metric, linkage):
@@ -180,13 +230,29 @@ def run(dataset, out_csv, linkage, min_leaf, max_leaf, max_pairs,
             if metric == 'euclidean':
                 t_seed = complete_linkage_meb_seed(A_pts, B_pts)
                 seed_valid = bool(validity(A_pts + t_seed, B_pts, comp_pts,
-                                            linkage, metric, eps=-REVALIDATION_TOL,
+                                            linkage, metric, eps=_reval_eps(metric),
                                             A_orig=A_pts))
             else:
                 t_seed, seed_valid = None, ''
 
             for which in to_run:
                 cseed = call_seed(dataset, linkage, seed, idx, which)
+                if metric == 'hamming' and which in EUCLIDEAN_ONLY:
+                    # Recorded, not omitted: an explicit N/A row keeps the
+                    # (pair, method) grid complete and resumable, and makes
+                    # the exclusion visible in the CSV rather than looking
+                    # like a method that silently found nothing.
+                    w.writerow(dict(
+                        dataset=dataset, linkage=linkage, metric=metric,
+                        pair_idx=idx, which=which, base_seed=seed,
+                        call_seed=cseed, n_A=len(A_lv), n_B=len(B_lv),
+                        n_competitors=len(comp_pts), s_A=s_A, s_B=s_B,
+                        s_star=s_star, valid=False, l2='', l2_sq='', l1='',
+                        linf='', n_features_changed='', seconds=0.0,
+                        aborted_timeout=False, error=NA_HAMMING,
+                        seed_valid=seed_valid))
+                    fh.flush()
+                    continue
                 _seed_everything(cseed)
                 lim = dice_timeout if which == 'dice' else timeout
                 err, A_prime, info = '', None, {}
@@ -205,7 +271,7 @@ def run(dataset, out_csv, linkage, min_leaf, max_leaf, max_pairs,
 
                 if A_prime is not None:
                     ok, margin = validity(A_prime, B_pts, comp_pts, linkage, metric,
-                                           eps=-REVALIDATION_TOL, A_orig=A_pts,
+                                           eps=_reval_eps(metric), A_orig=A_pts,
                                            return_margin=True)
                 else:
                     ok, margin = False, float('nan')

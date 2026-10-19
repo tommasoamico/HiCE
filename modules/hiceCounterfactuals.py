@@ -11,6 +11,163 @@ from scipy.optimize import minimize
 from itertools import combinations
 
 
+def _hamming_minmax_relabel(A_pts, B_pts):
+    """
+    Complete-linkage Hamming BASELINE: the rigid relabeling of A that
+    minimises A's FARTHEST Hamming distance to B, ignoring competitors.
+
+    This is the categorical counterpart of the Euclidean MEB baseline
+    (t* = -center(MEB(V_AB))): same role, same "min-max, competitors
+    ignored" semantics, so the achieved distance is the feasibility FLOOR
+    min_t d(A(t), B). If even this cannot beat a competitor, the pair's
+    counterfactual region is plausibly empty rather than the solver having
+    failed.
+
+    Move
+    ----
+    Per coordinate j a single function f_j is applied to EVERY point of A:
+    each source value alpha that A takes on j maps to one target value beta.
+    No bijection is required (two A-values may collapse onto one target).
+    This is the same move class as _solve_branch_hamming -- binary XOR is the
+    two-value special case -- and it is what keeps A a valid node: equal
+    A-values stay equal because f_j is a well-defined function.
+
+    Formulation (exact MILP, solved with scipy/HiGHS -- no licence needed)
+    --------------------------------------------------------------------
+    With indicators y[j, alpha, beta] = 1 iff f_j(alpha) = beta, Hamming
+    distance is affine:
+
+        d_H(f(a), b) = sum_j (1 - y[j, a_j, b_j]) = d - sum_j y[j, a_j, b_j]
+
+    so bounding the worst pair by an epigraph variable h gives
+
+        min  h + w * sum_j moved_j
+        s.t. sum_beta y[j, alpha, beta] = 1          for each (j, alpha)
+             sum_j y[j, a_j, b_j] + h >= d           for each (a, b) in AxB
+             moved_j + y[j, alpha, alpha] >= 1       for each (j, alpha)
+             y, moved binary;  0 <= h <= d
+
+    The `moved_j` term breaks ties toward relabeling FEWER coordinates. It
+    cannot disturb the min-max optimum: h takes integer values in unit
+    steps, and w is chosen so w * d < 1, so no tie-break can ever buy a
+    reduction in h. Without it the solver returns an arbitrary member of a
+    frequently large optimal set, which made the baseline non-deterministic
+    and needlessly dense.
+
+    Targets per coordinate are restricted to the values appearing in A or B
+    on that coordinate: mapping an A-value to something B never takes can
+    only ever add distance to B. Identity is therefore always available
+    (every source value is also a target), so "keep as-is" is always
+    feasible and the problem is never infeasible -- unlike the
+    competitor-constrained solve.
+
+    Returns
+    -------
+    relabel : {j: {alpha: beta}}
+        Per-coordinate relabeling map, matching the `info['t']` convention
+        of _solve_branch_hamming.
+    R : int
+        Achieved max Hamming distance from the relabeled A to B, in
+        coordinates (the feasibility floor).
+    apply : callable
+        apply(A_in) -> relabeled copy of A_in, for reusing the same f on
+        other rows.
+    """
+    A = np.asarray(A_pts)
+    B = np.asarray(B_pts)
+    n_A, d = A.shape
+
+    src = [sorted({int(v) for v in A[:, j]}) for j in range(d)]
+    tgt = [sorted({int(v) for v in A[:, j]} | {int(v) for v in B[:, j]})
+           for j in range(d)]
+
+    # ---- variable layout: y[j,alpha,beta], then moved_j, then h ----
+    ycol, col = {}, 0
+    for j in range(d):
+        for al in src[j]:
+            for be in tgt[j]:
+                ycol[(j, al, be)] = col
+                col += 1
+    mcol = {}
+    for j in range(d):
+        mcol[j] = col
+        col += 1
+    hcol = col
+    n_vars = col + 1
+
+    w = 1.0 / (2.0 * d + 1.0)          # w * d < 1, so h always dominates
+    c_obj = np.zeros(n_vars)
+    c_obj[hcol] = 1.0
+    for j in range(d):
+        c_obj[mcol[j]] = w
+
+    rows, lo, hi = [], [], []
+
+    # f_j is a function: exactly one target per source value
+    for j in range(d):
+        for al in src[j]:
+            r = np.zeros(n_vars)
+            for be in tgt[j]:
+                r[ycol[(j, al, be)]] = 1.0
+            rows.append(r); lo.append(1.0); hi.append(1.0)
+
+    # every A-B pair within h:  sum_j y[j,a_j,b_j] + h >= d
+    for a in A:
+        for b in B:
+            r = np.zeros(n_vars)
+            for j in range(d):
+                r[ycol[(j, int(a[j]), int(b[j]))]] += 1.0
+            r[hcol] = 1.0
+            rows.append(r); lo.append(float(d)); hi.append(np.inf)
+
+    # moved_j = 1 if any source value on j is not kept
+    for j in range(d):
+        for al in src[j]:
+            r = np.zeros(n_vars)
+            r[mcol[j]] = 1.0
+            r[ycol[(j, al, al)]] = 1.0
+            rows.append(r); lo.append(1.0); hi.append(np.inf)
+
+    constraints = LinearConstraint(np.array(rows), lo, hi)
+    integrality = np.ones(n_vars)
+    integrality[hcol] = 0                      # h is continuous (integral at opt)
+    ub = np.ones(n_vars)
+    ub[hcol] = float(d)
+    bounds = Bounds(lb=np.zeros(n_vars), ub=ub)
+
+    res = milp(c_obj, constraints=constraints, bounds=bounds,
+               integrality=integrality)
+    if not res.success or res.x is None:
+        # Identity is always feasible, so this means a solver failure rather
+        # than genuine infeasibility; fall back to the identity relabeling so
+        # the caller still gets a well-formed baseline it can score.
+        relabel = {j: {al: al for al in src[j]} for j in range(d)}
+    else:
+        x = res.x
+        relabel = {}
+        for j in range(d):
+            m = {}
+            for al in src[j]:
+                best = max(tgt[j], key=lambda be: x[ycol[(j, al, be)]])
+                m[al] = best
+            relabel[j] = m
+
+    def apply(A_in):
+        A_in = np.asarray(A_in)
+        out = A_in.copy()
+        for j in range(A_in.shape[1]):
+            mj = relabel.get(j, {})
+            for row in range(A_in.shape[0]):
+                v = int(A_in[row, j])
+                if v in mj:
+                    out[row, j] = mj[v]
+        return out
+
+    A_rel = apply(A)
+    R = int(max(int(np.count_nonzero(a != b)) for a in A_rel for b in B))
+    return relabel, R, apply
+
+
 class hiceCounterfactuals:
 
     def __init__(self, X:np.ndarray, Z:np.ndarray, 
