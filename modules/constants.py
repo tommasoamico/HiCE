@@ -37,6 +37,20 @@ METHOD_LABEL = {
 }
 
 # ======================================================================
+# Complete-linkage single-CF comparison (runCompleteLinkage.py). Same base
+# schema as FIELDNAMES so its rows stay directly comparable to the Ward
+# single-CF runs (the `linkage` column is what distinguishes them), plus the
+# complete-linkage solver's own diagnostics. `ward_phase` carries the generic
+# solver-phase string here too ('miqp-rowgen', 'trivial', ...), and
+# `n_active_balls` stays blank -- it is a Ward sphere-repair notion with no
+# complete-linkage analogue.
+# ======================================================================
+COMPLETE_FIELDNAMES = FIELDNAMES + [
+    'rowgen_rounds', 'rowgen_rows', 'rowgen_converged', 'rowgen_stalled_blocks',
+    'revalidated', 'margin_unsquared', 'one_class_pool', 'seed_valid',
+]
+
+# ======================================================================
 # Diversity experiment (runHierarchical.py): produce k counterfactuals per
 # (A, B) branch pair per method, instead of one -- schemas below.
 # ======================================================================
