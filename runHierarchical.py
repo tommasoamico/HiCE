@@ -237,8 +237,19 @@ def _cf_list_stats(cf_results, A_pts, B_pts, comp_pts, metric, Z, n_leaves, B_no
 # Main loop
 # ======================================================================
 def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
-        seed=0, eps=0.0, timeout=300):
+        seed=0, eps=0.0, timeout=300, dice_timeout=None):
     dataset_label = dataset
+    # DiCE gets its own, usually shorter, wall-clock budget: its genetic
+    # search cannot self-terminate, and on this experiment's pairs it hits
+    # the limit on ~55% of calls, every one of them returning ZERO valid
+    # counterfactuals after burning the full budget -- i.e. that time is
+    # pure waste, and it dominates total run time (83% of wall-clock).
+    # HiCE keeps the longer `timeout` because ITS slow calls do return
+    # usable results (its large-B pairs are exactly the low-tree-coverage
+    # ones), so shortening HiCE's budget would drop those pairs and
+    # artificially inflate its mean tree coverage. None = same as timeout.
+    if dice_timeout is None:
+        dice_timeout = timeout
 
     X, metric, types = load_openml(dataset, LINKAGE)
     if metric != 'euclidean':
@@ -338,7 +349,7 @@ def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
                 err = ''; cfs = []
                 t0 = time.perf_counter()
                 try:
-                    with time_limit(timeout):
+                    with time_limit(dice_timeout):
                         cfs = run_dice_baseline_multi(
                             A_pts, B_pts, comp_pts, LINKAGE, X_all=X,
                             mu_A=A_pts.mean(0), k=k, eps=eps, seed=cseed)
@@ -658,16 +669,23 @@ def main():
     ap.add_argument('--eps', type=float, default=0.0)
     ap.add_argument('--timeout', type=float, default=1200,
                      help="per-call wall-clock limit in seconds (0/negative disables)")
+    ap.add_argument('--dice-timeout', type=float, default=None,
+                     help="per-call wall-clock limit for DiCE only, in seconds; "
+                          "defaults to --timeout. See run()'s note on why DiCE "
+                          "warrants a shorter budget than the other methods.")
     ap.add_argument('--no-plot', action='store_true')
     a = ap.parse_args()
 
     timeout = a.timeout if a.timeout and a.timeout > 0 else None
+    dice_timeout = (a.dice_timeout if a.dice_timeout and a.dice_timeout > 0
+                    else (None if a.dice_timeout is not None else timeout))
 
     for dataset in a.dataset:
         print(f"\n===== dataset: {dataset} =====")
         try:
             run(dataset, a.out, a.k, a.min_leaf, a.max_leaf, a.max_pairs,
-                seed=a.seed, eps=a.eps, timeout=timeout)
+                seed=a.seed, eps=a.eps, timeout=timeout,
+                dice_timeout=dice_timeout)
         except ValueError as e:
             print(f"[skip] '{dataset}': {e}")
             continue
