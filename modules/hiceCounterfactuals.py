@@ -1555,6 +1555,23 @@ class hiceCounterfactuals:
                 continue
             competitor_nodes[node_id] = leaves
 
+        # A's OWN UNMOVED POSITION is a competitor, exactly as in
+        # _build_ward_geometry and in the complete-linkage wrapper. It must be
+        # added HERE and not left to the wrapper: this method rebuilds the
+        # competitor set from the live partition itself, so a caller's copy of
+        # it is not consulted and the constraint would simply vanish.
+        #
+        # Without it the model permits a "counterfactual" that barely moves --
+        # it can edge out every real competitor while still being closer to
+        # where A already was, which metrics.validity (via its A_orig
+        # argument) correctly rejects. Observed on wine pair 1: the solver
+        # returned a certified-optimal t with ||t|| = 2.84, SMALLER than the
+        # competitor-ignoring MEB baseline's 5.32, and independent
+        # revalidation marked it invalid. The symptom is distinctive --
+        # solver_optimal=True together with valid=False and a suspiciously
+        # small displacement.
+        competitor_nodes["__A_unmoved__"] = A_leaves_sorted
+
         extra_blocks = list(extra_blocks or [])
 
         def _zero_info(extra):
