@@ -4,6 +4,7 @@ from modules.utilityFunctions import project_sphere_closed_form, project_single_
 import miniball
 from scipy.spatial.distance import cdist
 from scipy.optimize import  milp, LinearConstraint, Bounds
+from scipy.sparse import coo_matrix
 import gurobipy as gp
 from gurobipy import GRB
 import cvxpy as cp
@@ -1887,24 +1888,48 @@ class hiceCounterfactuals:
                     col += 1
         n_vars = col
     
-        # big-M: domination LHS in [-d, d]; deactivation needs eps - M <= -d.
-        M = big_m if big_m is not None else d + abs(eps) + 1.0
-    
+        # big-M: the domination LHS lies in [-d, d], so deactivation at z = 0
+        # needs eps - M <= -d, i.e. M >= d + eps. Note how SMALL this is --
+        # tens, against integer-valued rows -- compared with the 1e5-1e6 the
+        # Euclidean solver's t-box produced, where Gurobi's integrality
+        # tolerance leaked M*1e-5 of slack and silently returned INVALID
+        # solutions. At this scale the same leakage is ~1e-5 against rows that
+        # move in unit steps, so it cannot flip a feasible row.
+        # Hamming distances are INTEGERS, so "strictly greater" means a gap of
+        # at least 1 and a margin of 0.5 is exactly equivalent to the caller's
+        # tiny eps -- while being vastly safer numerically. With M ~ d and
+        # HiGHS's integrality tolerance ~1e-5, a big-M row leaks ~2e-4 of
+        # slack, which is enough to let a TIE (gap 0) pass a row demanding
+        # gap >= 1e-6. That is the same leakage class that silently produced
+        # invalid Euclidean solutions; here it made row generation stall on a
+        # row already in the model and (before this) mis-report the pair as
+        # infeasible. 0.5 sits ~2500x above the leakage, so ties cannot pass.
+        eps_int = max(float(eps), 0.5)
+        M = big_m if big_m is not None else d + eps_int + 1.0
+
         c_obj = np.zeros(n_vars)
         #c_obj is the vector of coefficients that we will give in input to scipy's milp
         for j in range(d):
             c_obj[moved_col[j]] = 1.0  # minimize number of coordinates relabeled, i.e. small move and sparisty coincide
             # every variable has a weight of 1
     
-        A_rows, lb, ub = [], [], []
+        # Sparse (row, col, val) triplets instead of dense rows: each row
+        # touches ~d+2 of n_vars columns, so a dense matrix wasted virtually
+        # all its memory and was the binding limit on dataset size.
+        rr, cc, vv, lb, ub = [], [], [], [], []
+        _nrow = [0]
+
+        def _row(entries, lo, hi):
+            r = _nrow[0]
+            for cidx, val in entries:
+                rr.append(r); cc.append(cidx); vv.append(val)
+            lb.append(lo); ub.append(hi)
+            _nrow[0] += 1
     
         # (1) totality: each (j, alpha) maps to exactly one beta
         for j in range(d):
             for a in src_vals[j]:
-                row = np.zeros(n_vars)
-                for b in tgt_vals[j]:
-                    row[y_col[(j, a, b)]] = 1.0 # we put at 1 every coefficient
-                A_rows.append(row); lb.append(1.0); ub.append(1.0)
+                _row([(y_col[(j, a, b)], 1.0) for b in tgt_vals[j]], 1.0, 1.0)
                 # so basically we have sum_j y[j, a, b] = 1 which means that each value of alpha 
                 # is remapped to exactly one beta (which could be alpha itself)
     
@@ -1919,53 +1944,166 @@ class hiceCounterfactuals:
         # vecomes moved_j >=1, which enforces moved_j signal that j was relabelled
         for j in range(d):
             for a in src_vals[j]:
-                row = np.zeros(n_vars)
-                row[moved_col[j]] = 1.0 #coefficient of the constraint
-                row[y_col[(j, a, a)]] = 1.0 # coefficient of the constraint
-                A_rows.append(row) # Add to the constrain matrix
-                lb.append(1.0)
-                ub.append(np.inf)
+                _row([(moved_col[j], 1.0), (y_col[(j, a, a)], 1.0)],
+                     1.0, np.inf)
     
         # (3) at least one witness selected per competitor
         for nid in competitor_ids:
-            row = np.zeros(n_vars)
-            for a_i in range(n_A):
-                for c_leaf in competitor_nodes[nid]:
-                    row[z_col[(nid, a_i, c_leaf)]] = 1.0
-            A_rows.append(row); lb.append(1.0); ub.append(np.inf)
+            _row([(z_col[(nid, a_i, c_leaf)], 1.0)
+                  for a_i in range(n_A) for c_leaf in competitor_nodes[nid]],
+                 1.0, np.inf)
             # number of witnesses selected >= 1
     
-        # (4) domination: witness (a_i, c) beats every A-B pair (a', b):
+        # (4) domination, generated LAZILY.
+        #
+        # The exact row set is one per (witness, A-B pair) triple:
         #     sum_j y[j,a'_j,b_j] - sum_j y[j,a_i_j,c_j] - M*z >= eps - M
-        # if c is the withness z=1, the difference between the two sums is > eps i.e. 
-        # d - d(a',b) > d - d(a, c), d(a, c) > d(a', b). Remember the definition d(a, b) = d - sum_j y[j, a_j, b_j]
+        # which at z = 1 reads d_H(f(a_i), c) >= d_H(f(a'), b) + eps: the
+        # selected witness out-distances that pair. Those rows number
+        # (n_A * sum_X |X|) * (n_A * n_B) -- MULTIPLICATIVE, with n_A squared
+        # since it sizes both factors. For a 1728-row dataset at
+        # n_A = n_B = 15 that is ~5.8M rows which, as the dense matrix this
+        # used to build, is ~8 GB for ONE pair: not slow but impossible, and
+        # it capped this solver to tiny datasets.
+        #
+        # So rows are generated on demand, exactly as the Euclidean MIQP
+        # does: seed one row per witness, solve, add only the rows the
+        # incumbent actually violates, repeat. The generated model is a
+        # RELAXATION of the full one (a subset of its rows), so its optimum
+        # bounds the full optimum from below; terminating with nothing
+        # violated means the incumbent is feasible for the full model and
+        # therefore optimal for it. The seeded model has n_A * sum_X |X| rows
+        # -- the same additive order a single-epigraph reformulation would
+        # give, but without altering semantics that are already verified
+        # against brute-force enumeration.
+        #
+        # (An epigraph on d(A,B) was tried and abandoned. It should be
+        # equivalent and provably no looser, yet it accepted tie solutions
+        # that brute force proves are not strictly dominating, on competitors
+        # whose rows were somehow not binding. Not reintroduced until that is
+        # understood.)
+        comp_witnesses = {nid: [(a_i, c_leaf)
+                                for a_i in range(n_A)
+                                for c_leaf in competitor_nodes[nid]]
+                          for nid in competitor_ids}
+        comp_cvals = {nid: {c_leaf: np.asarray(self.X[c_leaf]).tolist()
+                            for c_leaf in competitor_nodes[nid]}
+                      for nid in competitor_ids}
 
+        base_rr, base_cc, base_vv = list(rr), list(cc), list(vv)
+        base_lb, base_ub, base_n = list(lb), list(ub), _nrow[0]
+        added = set()
+        gen = {'rr': [], 'cc': [], 'vv': [], 'lb': [], 'ub': []}
 
-        # To speed it up we need to implement lazy constraint generation, consider also that
-        # in low dimensions we improve a lot with hull reduction
+        def add_dom(nid, a_i, c_leaf, ap_i, b_i):
+            key = (nid, a_i, c_leaf, ap_i, b_i)
+            if key in added:
+                return False
+            c = comp_cvals[nid][c_leaf]
+            ent = {}
+            for j in range(d):
+                key_b = (j, Acols[j][ap_i], Bcols[j][b_i])
+                if key_b in y_col:
+                    ent[y_col[key_b]] = ent.get(y_col[key_b], 0.0) + 1.0
+                key_c = (j, Acols[j][a_i], c[j])
+                if key_c in y_col:   # absent -> competitor-only value, never matches
+                    ent[y_col[key_c]] = ent.get(y_col[key_c], 0.0) - 1.0
+            zc = z_col[(nid, a_i, c_leaf)]
+            ent[zc] = ent.get(zc, 0.0) - M
+            r = base_n + len(gen['lb'])
+            for cidx, val in ent.items():
+                gen['rr'].append(r); gen['cc'].append(cidx); gen['vv'].append(val)
+            gen['lb'].append(eps_int - M); gen['ub'].append(np.inf)
+            added.add(key)
+            return True
+
+        def _solve_current():
+            nrows = base_n + len(gen['lb'])
+            A_sp = coo_matrix((base_vv + gen['vv'],
+                               (base_rr + gen['rr'], base_cc + gen['cc'])),
+                              shape=(nrows, n_vars)).tocsr()
+            cons = LinearConstraint(A_sp, np.array(base_lb + gen['lb']),
+                                    np.array(base_ub + gen['ub']))
+            bnds = Bounds(lb=np.zeros(n_vars), ub=np.ones(n_vars))
+            return milp(c_obj, constraints=cons, bounds=bnds,
+                        integrality=np.ones(n_vars))
+
+        def _relabel_of(x):
+            rel = {j: {} for j in range(d)}
+            for j in range(d):
+                for a in src_vals[j]:
+                    for b in tgt_vals[j]:
+                        if x[y_col[(j, a, b)]] > 0.5:
+                            rel[j][a] = b
+                            break
+                    rel[j].setdefault(a, a)
+            out = A_pts.copy()
+            for j in range(d):
+                out[:, j] = [rel[j].get(int(v), int(v)) for v in A_pts[:, j].tolist()]
+            return out
+
+        # seed one row per witness, at the pair farthest apart under the
+        # IDENTITY relabeling -- the likeliest binding pair before any solve
+        d0 = np.array([[int(np.count_nonzero(A_pts[ap] != B_pts[bi]))
+                        for bi in range(n_B)] for ap in range(n_A)])
+        ap0, b0 = np.unravel_index(int(np.argmax(d0)), d0.shape)
         for nid in competitor_ids:
-            for a_i in range(n_A):
-                for c_leaf in competitor_nodes[nid]:
-                    c = np.asarray(self.X[c_leaf]).tolist()
-                    zc = z_col[(nid, a_i, c_leaf)]
-                    for ap_i in range(n_A):
-                        for b_i in range(n_B):
-                            row = np.zeros(n_vars)
-                            for j in range(d):
-                                key_b = (j, Acols[j][ap_i], Bcols[j][b_i])
-                                if key_b in y_col:
-                                    row[y_col[key_b]] += 1.0
-                                key_c = (j, Acols[j][a_i], c[j])
-                                if key_c in y_col:          # absent -> competitor-only value, no match
-                                    row[y_col[key_c]] -= 1.0
-                            row[zc] += -M
-                            A_rows.append(row); lb.append(eps - M); ub.append(np.inf)
-    
-        constraints = LinearConstraint(np.array(A_rows), np.array(lb), np.array(ub))
-        bounds = Bounds(lb=np.zeros(n_vars), ub=np.ones(n_vars))
-        integrality = np.ones(n_vars)  # all binary (y, moved_j, z)
-    
-        res = milp(c_obj, constraints=constraints, bounds=bounds, integrality=integrality)
+            for (a_i, c_leaf) in comp_witnesses[nid]:
+                add_dom(nid, a_i, c_leaf, int(ap0), int(b0))
+
+        max_rounds, rows_per_round = 64, 64
+        converged, rounds, res = False, 0, None
+        for rounds in range(1, max_rounds + 1):
+            res = _solve_current()
+            if not res.success or res.x is None:
+                # a relaxation proven infeasible proves the full model is too
+                return None, {"feasible": False, "rowgen_rounds": rounds,
+                              "rowgen_rows": len(added), "rowgen_converged": True}
+            x = res.x
+            A_rel = _relabel_of(x)
+            dAB = np.array([[int(np.count_nonzero(A_rel[ap] != B_pts[bi]))
+                             for bi in range(n_B)] for ap in range(n_A)])
+            any_added, stalled = False, 0
+            for nid in competitor_ids:
+                sel = [w for w in comp_witnesses[nid]
+                       if x[z_col[(nid, w[0], w[1])]] > 0.5]
+                if not sel:
+                    continue
+                satisfied, viol = False, {}
+                for (a_i, c_leaf) in sel:
+                    dw = int(np.count_nonzero(A_rel[a_i] != np.asarray(self.X[c_leaf])))
+                    bad = np.argwhere(dAB + eps_int > dw)
+                    if len(bad) == 0:
+                        satisfied = True
+                        break
+                    viol[(a_i, c_leaf)] = bad
+                if satisfied:
+                    continue
+                w_best = min(viol, key=lambda k: len(viol[k]))
+                for (ap_i, b_i) in viol[w_best][:rows_per_round]:
+                    if add_dom(nid, w_best[0], w_best[1], int(ap_i), int(b_i)):
+                        any_added = True
+                    else:
+                        stalled += 1
+            if not any_added:
+                # Distinguish true convergence from "violated but every
+                # offending row is already present", which would mean the
+                # solver broke a row it was given rather than a row being
+                # missing -- adding more cannot fix that, so do not call it
+                # converged (the Euclidean solver learned this the hard way).
+                converged = (stalled == 0)
+                break
+
+        # A stall (violated, but every offending row already present) means
+        # the solver broke a row it was given -- a numerical failure, not a
+        # proof of emptiness. Reporting it as infeasible was wrong: it made
+        # this solver claim infeasible on a lymph pair the full dense model
+        # solves with 2 coordinates changed. Fall through and return the
+        # incumbent with rowgen_converged=False / optimal=False instead, so
+        # the caller's independent validity check adjudicates rather than a
+        # false "no counterfactual exists".
+        stalled_out = not converged
+
         if not res.success:
             # genuinely possible for complete linkage (a spread-out B may be undominatable)
             return None, {"feasible": False}
@@ -2002,6 +2140,14 @@ class hiceCounterfactuals:
             "coords_changed": coords_changed,  # == bits flipped for binary data
             "distance_moved": coords_changed,
             "binding_witnesses": binding,
+            "phase": "milp-rowgen",
+            "rowgen_rounds": rounds,
+            "rowgen_rows": len(added),
+            "rowgen_converged": not stalled_out,
+            # optimal only on true convergence: no violated row left means the
+            # relaxation optimum is full-model feasible, hence full-model
+            # optimal. A stall carries no such guarantee.
+            "optimal": not stalled_out,
         }
         return A_prime, info
 
