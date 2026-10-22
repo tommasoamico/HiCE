@@ -75,7 +75,7 @@ from modules.constants import COMPLETE_FIELDNAMES
 from modules.hiceCounterfactuals import hiceCounterfactuals
 from modules.utilityFunctions import (
     MethodTimeout, _prepare_out_csv, time_limit, call_seed, _seed_everything,
-    load_openml, complete_linkage_meb_seed,
+    load_openml_cached, complete_linkage_meb_seed,
 )
 from modules.metrics import validity, proximity
 from modules.dice import run_dice_baseline_multi
@@ -197,7 +197,7 @@ def run(dataset, out_csv, linkage, min_leaf, max_leaf, max_pairs,
     if dice_timeout is None:
         dice_timeout = timeout
 
-    X, metric, _types = load_openml(dataset, linkage)
+    X, metric, _types = load_openml_cached(dataset, linkage)
     print(f"[data] '{dataset}': {X.shape} (metric={metric}, linkage={linkage})")
     Z = _build_tree(X, metric, linkage)
     cf = hiceCounterfactuals(X=X, Z=Z, metric=metric, linkage=linkage, anchor='min')
@@ -339,6 +339,14 @@ def main():
                 seed=a.seed, eps=a.eps, timeout=timeout, dice_timeout=dice_timeout)
         except ValueError as e:
             print(f"[skip] '{dataset}': {e}")
+            continue
+        except Exception as e:
+            # Anything else (a dead OpenML, a solver blowing up on one
+            # dataset) must not take down the whole multi-day run. The output
+            # is resumable per (dataset, linkage, pair_idx, which), so a
+            # dataset abandoned here is simply picked up by the next launch.
+            print(f"[error] '{dataset}': {type(e).__name__}: {e} "
+                  f"-- continuing with the next dataset", flush=True)
             continue
 
 

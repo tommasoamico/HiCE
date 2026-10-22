@@ -63,7 +63,7 @@ from modules.constants import (
 from modules.hiceCounterfactuals import hiceCounterfactuals
 from modules.utilityFunctions import (
     MethodTimeout, _prepare_out_csv, time_limit,
-    call_seed, _seed_everything, load_openml,
+    call_seed, _seed_everything, load_openml_cached,
 )
 from modules.metrics import (
     validity, proximity, tree_coverage, tree_coverage_from_targets, is_degenerate_tie,
@@ -251,7 +251,7 @@ def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
     if dice_timeout is None:
         dice_timeout = timeout
 
-    X, metric, types = load_openml(dataset, LINKAGE)
+    X, metric, types = load_openml_cached(dataset, LINKAGE)
     if metric != 'euclidean':
         raise ValueError(
             f"'{dataset}' resolved to metric={metric!r}; this diversity "
@@ -688,6 +688,14 @@ def main():
                 dice_timeout=dice_timeout)
         except ValueError as e:
             print(f"[skip] '{dataset}': {e}")
+            continue
+        except Exception as e:
+            # One dataset failing (a dead OpenML, a blocked route) must not
+            # end a multi-day run. This gap is why the Ward run was set to
+            # die at its final dataset once openml.org became unreachable:
+            # OpenMLServerError is not a ValueError, so it propagated.
+            print(f"[error] '{dataset}': {type(e).__name__}: {e} "
+                  f"-- continuing with the next dataset", flush=True)
             continue
 
     if a.no_plot:
