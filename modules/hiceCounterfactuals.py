@@ -10,6 +10,7 @@ from gurobipy import GRB
 import cvxpy as cp
 from scipy.optimize import minimize
 from itertools import combinations
+import time as _time
 
 
 def _hamming_minmax_relabel(A_pts, B_pts):
@@ -136,8 +137,12 @@ def _hamming_minmax_relabel(A_pts, B_pts):
     ub[hcol] = float(d)
     bounds = Bounds(lb=np.zeros(n_vars), ub=ub)
 
+    # Bounded for the same reason as _solve_branch_hamming's solve: a
+    # SIGALRM-based timeout cannot interrupt HiGHS, so the limit must be passed
+    # in. Identity is always feasible here, so exhausting the budget degrades
+    # to the identity relabeling rather than to a wrong answer.
     res = milp(c_obj, constraints=constraints, bounds=bounds,
-               integrality=integrality)
+               integrality=integrality, options={"time_limit": 300.0})
     if not res.success or res.x is None:
         # Identity is always feasible, so this means a solver failure rather
         # than genuine infeasibility; fall back to the identity relabeling so
@@ -714,7 +719,8 @@ class hiceCounterfactuals:
     def _solve_ward_core(self, A_pts, mu_A, mu_B, E, free_idx, fixed_idx, k_free,
                           convex_ball_in, convex_half, rev_balls,
                           sparsity, lam, use_sparsity, allowed_features,
-                          n_competitors, d, socp_solver, exhaustive, index_to_name):
+                          n_competitors, d, socp_solver, exhaustive, index_to_name,
+                          phase_probe=False):
         """
         Phase 1-4 solve logic of counterfactual_ward_branch, extracted to
         operate on already-built Apollonius data (convex_ball_in/convex_half/
@@ -874,6 +880,23 @@ class hiceCounterfactuals:
             return _finish(p, "phase3-greedy", not use_sparsity)
 
         # ---------------- Phase 4: active-set enumeration ----------------
+        # PHASE PROBE: when we only want to know WHICH phase a solve reaches,
+        # stop here. Phase 4 is the combinatorial part -- it enumerates
+        # combinations(rev_balls, k) and is what makes hard pairs explode --
+        # and running it changes nothing about the answer to "which phase did
+        # this reach". Returning mu_B, the same guaranteed-feasible fallback
+        # phase 4 itself uses when enumeration finds nothing, keeps the
+        # diversity descent moving at negligible cost.
+        #
+        # Fidelity caveat: the returned point is NOT the phase-4 optimum, so
+        # any solve DOWNSTREAM of a probed node sees a different incumbent
+        # than the real run would. The first phase-4 entry on each path is
+        # faithful; phases recorded after one are indicative only. That is
+        # enough for the question this probe exists to answer -- whether the
+        # expensive pairs reach phase 4 at all.
+        if phase_probe:
+            return _finish(mu_B.copy(), "phase4-entered", False)
+
         kmax = min(d, len(rev_balls))
         best_p, best_val = None, np.inf
         for k in range(1, kmax + 1):
@@ -898,7 +921,8 @@ class hiceCounterfactuals:
         return _finish(best_p, phase, opt)
 
     def diverseCounterfactuals(self, B_leaves, A_leaves, max_depth=None,
-                                both_children=False, **kwargs):
+                                both_children=False, include_leaf_targets=True,
+                                **kwargs):
         """
         Hierarchical diverse counterfactuals for Ward-linkage: descend B's own
         dendrogram subtree. The original "under B" domination constraints
@@ -951,6 +975,19 @@ class hiceCounterfactuals:
             the parent CF. If True, descend into both children at every
             internal node, producing one counterfactual per node of B's
             subtree.
+        include_leaf_targets : bool
+            If True (default), a child that is itself a single leaf still
+            gets its own sibling-preference-constrained solve, exactly like
+            a branch child. If False, descent stops one level early: a leaf
+            child is never solved for or added to `results` (its sibling-
+            preference constraint isn't even built). Leaf targets can never
+            count as a represented sub-branch (a "sub-branch" requires >=2
+            leaves -- see metrics.tree_coverage_from_targets), so a caller
+            that only cares about sub-branch coverage (e.g. runHierarchical.
+            py's diversity experiment) can set this False to both skip
+            wasted solver calls on nodes whose result could never be used
+            for coverage, and guarantee every returned candidate is
+            coverage-eligible.
         **kwargs
             Forwarded to counterfactual_ward_branch (e.g. eps, sparsity, lam,
             index_to_name, socp_solver, allowed_features).
@@ -1009,7 +1046,8 @@ class hiceCounterfactuals:
                 A_pts, mu_A, mu_B, E, free_idx, fixed_idx, k_free,
                 convex_ball_in, convex_half, rev_balls,
                 sparsity, lam, use_sparsity, allowed_features,
-                n_base_competitors + n_extra, d, socp_solver, exhaustive, index_to_name)
+                n_base_competitors + n_extra, d, socp_solver, exhaustive, index_to_name,
+                phase_probe=kwargs.get('phase_probe', False))
 
         def new_constraint_satisfied(kind, idx, p, tol=1e-6):
             # Feasibility test for exactly the ONE newly-accumulated sibling
@@ -1084,6 +1122,11 @@ class hiceCounterfactuals:
             t_here, optimal_here = info["t"], info.get("optimal", False)
 
             def descend(child, child_leaves, sibling_node, sibling_leaves, path_pair):
+                if not include_leaf_targets and child < self.n:
+                    # Leaf child: no sub-branch to represent and nothing to
+                    # descend into further, so skip the solve entirely
+                    # rather than compute and then discard it.
+                    return
                 # Sibling-preference constraint: d(A, child) < d(A, sibling),
                 # built with child's OWN centroid/weight as "near" (not B's)
                 # -- see diverseCounterfactuals' docstring for why this,
@@ -1116,6 +1159,202 @@ class hiceCounterfactuals:
                     descend(c_left, left_leaves, c_right, right_leaves, (c_left, c_right))
 
         visit(B_node, 0, [], 0, None, False, None)
+        return results
+
+    def diverseCounterfactualsComplete(self, B_leaves, A_leaves, max_depth=None,
+                                        both_children=True, include_leaf_targets=False,
+                                        **kwargs):
+        """
+        Complete-linkage counterpart of diverseCounterfactuals: descend B's own
+        dendrogram subtree, specialising the counterfactual to one sub-branch
+        at a time, while keeping the original "A is under B" domination
+        constraints at every node.
+
+        The recipe is identical in spirit to Ward's; only the encoding of the
+        one sibling-preference comparison differs, because complete-linkage
+        distance is a MAX over pairs rather than a single centroid distance:
+
+            d(A(t), child) < d(A(t), sibling)
+
+        Under Ward this collapses to one Apollonius surface. Under complete
+        linkage it does not -- it becomes the same existential the base
+        domination constraints already use:
+
+            EXISTS q in V_{A, sibling} such that
+                ||q + t|| >= ||p + t|| + eps   for ALL p in V_{A, child}
+
+        which is exact (if the sibling's max exceeds the child's, the
+        sibling's own argmax witnesses it; conversely any such q forces it).
+        So each level of descent contributes exactly one more witness-
+        disjunction BLOCK -- near = the target child, far = its sibling --
+        carried through `extra_blocks` into the MIQP. That hook exists for
+        precisely this; the solver itself needs no change.
+
+        Note the near-set of a sibling block is V_{A, child}, NOT V_{A, B}.
+        That is why _cl_block keeps its own P per block rather than sharing
+        one global P the way the original enumeration-era code did.
+
+        Differences from Ward worth knowing:
+
+        * Ward is always feasible; complete linkage is not. A spread-out child
+          may be genuinely undominatable against its sibling, so infeasible
+          nodes are expected rather than a symptom, and they prune the subtree
+          below them (feasible regions are nested and shrink with depth).
+        * There is no "inherited-parent" shortcut. Ward can reuse a parent's
+          solution when the one new constraint is already satisfied, because
+          the parent's point is provably optimal for the smaller region. Here
+          the new constraint is a disjunction whose satisfaction depends on
+          which witness is selected, so that argument does not carry; every
+          node is solved. This makes the descent markedly more expensive than
+          Ward's, which is why the per-call budget matters.
+
+        Parameters mirror diverseCounterfactuals. `both_children=True` and
+        `include_leaf_targets=False` default to the settings the Ward
+        diversity experiment ended up using: descend into both children, and
+        do not spend a solve on a leaf target, which can never count as a
+        represented sub-branch.
+
+        Returns a list of dicts with target_node / path / A_prime / info /
+        depth, exactly like diverseCounterfactuals, so the same downstream
+        scoring (notably metrics.tree_coverage_from_targets, which is
+        linkage-agnostic because it matches target-node identity rather than
+        routing geometrically) applies unchanged.
+        """
+        A_node, A_leaves_sorted, _s_A = self._resolve_branch(A_leaves)
+        B_node, B_leaves_sorted, _s_B = self._resolve_branch(B_leaves)
+        if A_node == B_node:
+            raise ValueError("A_leaves and B_leaves resolve to the same node.")
+        A_pts = np.asarray(self.X[A_leaves_sorted], dtype=float)
+        d = A_pts.shape[1]
+
+        solver_kw = {k: v for k, v in kwargs.items()
+                     if k in ("eps", "index_to_name", "t_bound", "time_limit",
+                              "verbose", "sparsity", "lam", "allowed_features",
+                              "max_rounds", "rows_per_round")}
+
+        def sibling_block(child_leaves, sibling_node, sibling_leaves):
+            """One witness-disjunction block: near = child, far = sibling."""
+            C = np.asarray(self.X[child_leaves], dtype=float)
+            S = np.asarray(self.X[sibling_leaves], dtype=float)
+            P = (A_pts[:, None, :] - C[None, :, :]).reshape(-1, d)
+            Q = (A_pts[:, None, :] - S[None, :, :]).reshape(-1, d)
+            labels = [lf for _a in range(len(A_pts)) for lf in sibling_leaves]
+            return self._cl_block(("sibling", sibling_node), P, Q, labels)
+
+        results = []
+
+        def visit(node, depth, path, blocks):
+            A_prime, info = self.counterfactual_complete_linkage_branch_gurobi(
+                B_leaves, A_leaves, metric='euclidean',
+                extra_blocks=blocks, **solver_kw)
+            results.append({"target_node": node, "path": list(path),
+                            "A_prime": A_prime, "info": info, "depth": depth})
+            if not info.get("feasible", False):
+                return                      # nested regions: prune the subtree
+            if max_depth is not None and depth >= max_depth:
+                return
+            children = get_children(self.Z, self.n, node)
+            if children is None:
+                return
+            c_left, c_right = children
+            lv_l, lv_r = self.get_leaves(c_left), self.get_leaves(c_right)
+
+            def descend(child, child_leaves, sib, sib_leaves):
+                if not include_leaf_targets and child < self.n:
+                    return                  # a leaf can never be a sub-branch
+                visit(child, depth + 1, path + [(child, sib)],
+                      blocks + [sibling_block(child_leaves, sib, sib_leaves)])
+
+            if both_children:
+                descend(c_left, lv_l, c_right, lv_r)
+                descend(c_right, lv_r, c_left, lv_l)
+            else:
+                descend(c_left, lv_l, c_right, lv_r)
+
+        visit(B_node, 0, [], [])
+        return results
+
+    def diverseCounterfactualsCompleteHamming(self, B_leaves, A_leaves,
+                                               max_depth=None, both_children=True,
+                                               include_leaf_targets=False,
+                                               eps=1e-6, time_limit=None,
+                                               index_to_name=None):
+        """
+        Hamming counterpart of diverseCounterfactualsComplete.
+
+        Identical recipe -- descend B's subtree, keep the original "A is under
+        B" constraints, and add one sibling-preference requirement per level:
+
+            d(A(f), child) < d(A(f), sibling)
+
+        Under Hamming this is again a witness disjunction, but it rides on the
+        SAME relabeling variables y[j, alpha, beta] as everything else, because
+        the move is one shared f applied to all of A. Expanding
+        d_H(f(a), p) = d - sum_j y[j, a_j, p_j], the requirement becomes a row
+        that is affine in y:
+
+            sum_j y[j, a'_j, r_j] - sum_j y[j, a_i_j, l_j] >= eps
+
+        for every (a', r) with r in the target child, where (a_i, l) is the
+        selected witness from the sibling. That is the same affine form the
+        base competitor rows already use, with the child as the near set and
+        the sibling as the far set -- so it enters as one more BLOCK, which is
+        exactly what _solve_branch_hamming's extra_blocks takes.
+
+        Target values need no extension: both children are subsets of B, whose
+        values are already in tgt_vals, so no new y variables are created --
+        only witness binaries.
+
+        As in the Euclidean complete-linkage descent, there is no
+        inherited-parent shortcut and nodes can be genuinely infeasible, which
+        prunes the subtree beneath them.
+        """
+        A_node, A_leaves_sorted, s_A = self._resolve_branch(A_leaves)
+        B_node, B_leaves_sorted, s_B = self._resolve_branch(B_leaves)
+        if A_node == B_node:
+            raise ValueError("A_leaves and B_leaves resolve to the same node.")
+        A_pts = np.asarray(self.X[A_leaves_sorted])
+        B_pts = np.asarray(self.X[B_leaves_sorted])
+
+        live = self._alive_clusters_before_row(min(s_A, s_B) + 1)
+        A_set, B_set = set(A_leaves_sorted), set(B_leaves_sorted)
+        competitor_nodes = {nid: lv for nid, lv in live.items()
+                            if not (set(lv) <= A_set or set(lv) <= B_set)}
+        competitor_nodes["__A_unmoved__"] = A_leaves_sorted
+
+        results = []
+
+        def visit(node, depth, path, blocks):
+            A_prime, info = self._solve_branch_hamming(
+                A_pts, B_pts, competitor_nodes, eps, None, index_to_name,
+                time_limit=time_limit, extra_blocks=blocks)
+            results.append({"target_node": node, "path": list(path),
+                            "A_prime": A_prime, "info": info, "depth": depth})
+            if not info.get("feasible", False):
+                return
+            if max_depth is not None and depth >= max_depth:
+                return
+            children = get_children(self.Z, self.n, node)
+            if children is None:
+                return
+            c_left, c_right = children
+            lv_l, lv_r = self.get_leaves(c_left), self.get_leaves(c_right)
+
+            def descend(child, child_leaves, sib, sib_leaves):
+                if not include_leaf_targets and child < self.n:
+                    return
+                blk = (("sibling", sib),
+                       np.asarray(self.X[sorted(child_leaves)]),
+                       sorted(sib_leaves))
+                visit(child, depth + 1, path + [(child, sib)], blocks + [blk])
+
+            if both_children:
+                descend(c_left, lv_l, c_right, lv_r)
+                descend(c_right, lv_r, c_left, lv_l)
+            else:
+                descend(c_left, lv_l, c_right, lv_r)
+
+        visit(B_node, 0, [], [])
         return results
 
     def counterfactual_complete_linkage_branch(self, B_leaves, A_leaves,
@@ -1286,8 +1525,12 @@ class hiceCounterfactuals:
                 verbose=verbose, sparsity=sparsity, lam=lam,
                 allowed_features=allowed_features, extra_blocks=extra_blocks)
         elif metric == 'hamming':
+            # time_limit is forwarded, not just accepted: the hamming path is
+            # a C-extension MILP that a SIGALRM wrapper cannot interrupt, so
+            # this is the only limit that actually binds it.
             A_prime, info = self._solve_branch_hamming(
-                A_pts, B_pts, competitor_nodes, eps, big_m, index_to_name)
+                A_pts, B_pts, competitor_nodes, eps, big_m, index_to_name,
+                time_limit=time_limit)
         else:
             raise ValueError(f"Unsupported metric: {metric!r}; use 'euclidean' or 'hamming'.")
 
@@ -1796,7 +2039,8 @@ class hiceCounterfactuals:
         return A_prime, info
 
 
-    def _solve_branch_hamming(self, A_pts, B_pts, competitor_nodes, eps, big_m, index_to_name):
+    def _solve_branch_hamming(self, A_pts, B_pts, competitor_nodes, eps, big_m,
+                               index_to_name, time_limit=None, extra_blocks=None):
         """
         Complete-linkage Hamming counterfactual under the RIGID RELABELING move
         (binary OR categorical), consistent with the convention or rigid translation.
@@ -1862,7 +2106,10 @@ class hiceCounterfactuals:
         Acols = [A_pts[:, j].tolist() for j in range(d)]
         Bcols = [B_pts[:, j].tolist() for j in range(d)]
         src_vals = [sorted(set(Acols[j])) for j in range(d)]                 # sources: A's values
-        tgt_vals = [sorted(set(Acols[j]) | set(Bcols[j])) for j in range(d)]  # targets: A ∪ B values
+        _extra_near = [np.asarray(nb) for _k, nb, _f in (extra_blocks or [])]
+        tgt_vals = [sorted(set(Acols[j]) | set(Bcols[j])
+                           | {int(v) for nb in _extra_near for v in nb[:, j]})
+                    for j in range(d)]  # targets: A u B u any block's near values
     
         # ---- variable layout: y[j,alpha,beta], then moved_j, then z[nid,a_i,c_leaf] ----
         y_col, col = {}, 0 #look-up dictionary that tells us where the variable y[j, a, b] lives
@@ -1880,13 +2127,42 @@ class hiceCounterfactuals:
         # and the big-M domination rows enforce that the selected witness actually 
         # beats every A–B pair.
         competitor_ids = list(competitor_nodes.keys())
+        _all_blocks = [(nid, list(competitor_nodes[nid])) for nid in competitor_ids]
+        _all_blocks += [(key, list(far)) for key, _near, far in (extra_blocks or [])]
         z_col = {}
-        for nid in competitor_ids:
+        for nid, far_leaves in _all_blocks:
             for a_i in range(n_A):
-                for c_leaf in competitor_nodes[nid]:
+                for c_leaf in far_leaves:
                     z_col[(nid, a_i, c_leaf)] = col
                     col += 1
         n_vars = col
+
+        # Each BLOCK is one domination requirement with its own NEAR set --
+        # the pairs a witness must out-distance -- and its own FAR leaves,
+        # from which witnesses are drawn:
+        #
+        #   base block      near = B,            far = a competitor
+        #   sibling block   near = target child, far = that child's sibling
+        #
+        # The original code hardcoded near = B for every block, which is why a
+        # sibling-preference constraint could not be expressed: its near set is
+        # V_{A, child}, not V_{A, B}. extra_blocks is a list of
+        # (key, near_pts, far_leaves); omitting it reproduces the previous
+        # behaviour exactly.
+        blocks = {}
+        for nid in competitor_ids:
+            blocks[nid] = (np.asarray(B_pts), list(competitor_nodes[nid]))
+        for key, near_pts, far_leaves in (extra_blocks or []):
+            blocks[key] = (np.asarray(near_pts), list(far_leaves))
+        block_ids = list(blocks.keys())
+
+        comp_witnesses = {k: [(a_i, lf) for a_i in range(n_A) for lf in blocks[k][1]]
+                          for k in block_ids}
+        comp_cvals = {k: {lf: np.asarray(self.X[lf]).tolist() for lf in blocks[k][1]}
+                      for k in block_ids}
+        block_near = {k: blocks[k][0] for k in block_ids}
+        block_nearcols = {k: [block_near[k][:, j].tolist() for j in range(d)]
+                          for k in block_ids}
     
         # big-M: the domination LHS lies in [-d, d], so deactivation at z = 0
         # needs eps - M <= -d, i.e. M >= d + eps. Note how SMALL this is --
@@ -1948,9 +2224,9 @@ class hiceCounterfactuals:
                      1.0, np.inf)
     
         # (3) at least one witness selected per competitor
-        for nid in competitor_ids:
+        for nid in block_ids:
             _row([(z_col[(nid, a_i, c_leaf)], 1.0)
-                  for a_i in range(n_A) for c_leaf in competitor_nodes[nid]],
+                  for a_i, c_leaf in comp_witnesses[nid]],
                  1.0, np.inf)
             # number of witnesses selected >= 1
     
@@ -1982,13 +2258,7 @@ class hiceCounterfactuals:
         # that brute force proves are not strictly dominating, on competitors
         # whose rows were somehow not binding. Not reintroduced until that is
         # understood.)
-        comp_witnesses = {nid: [(a_i, c_leaf)
-                                for a_i in range(n_A)
-                                for c_leaf in competitor_nodes[nid]]
-                          for nid in competitor_ids}
-        comp_cvals = {nid: {c_leaf: np.asarray(self.X[c_leaf]).tolist()
-                            for c_leaf in competitor_nodes[nid]}
-                      for nid in competitor_ids}
+
 
         base_rr, base_cc, base_vv = list(rr), list(cc), list(vv)
         base_lb, base_ub, base_n = list(lb), list(ub), _nrow[0]
@@ -2000,9 +2270,10 @@ class hiceCounterfactuals:
             if key in added:
                 return False
             c = comp_cvals[nid][c_leaf]
+            nearcols = block_nearcols[nid]
             ent = {}
             for j in range(d):
-                key_b = (j, Acols[j][ap_i], Bcols[j][b_i])
+                key_b = (j, Acols[j][ap_i], nearcols[j][b_i])
                 if key_b in y_col:
                     ent[y_col[key_b]] = ent.get(y_col[key_b], 0.0) + 1.0
                 key_c = (j, Acols[j][a_i], c[j])
@@ -2017,6 +2288,14 @@ class hiceCounterfactuals:
             added.add(key)
             return True
 
+        t_start = _time.monotonic()
+
+        def _remaining():
+            """Seconds of budget left, or None if unbounded."""
+            if time_limit is None:
+                return None
+            return max(1.0, time_limit - (_time.monotonic() - t_start))
+
         def _solve_current():
             nrows = base_n + len(gen['lb'])
             A_sp = coo_matrix((base_vv + gen['vv'],
@@ -2025,8 +2304,23 @@ class hiceCounterfactuals:
             cons = LinearConstraint(A_sp, np.array(base_lb + gen['lb']),
                                     np.array(base_ub + gen['ub']))
             bnds = Bounds(lb=np.zeros(n_vars), ub=np.ones(n_vars))
+            # The budget MUST be handed to HiGHS, not merely wrapped around
+            # this call. utilityFunctions.time_limit raises from a SIGALRM
+            # handler, and Python can only run a signal handler between
+            # bytecodes -- but milp() is a C extension that holds the GIL for
+            # the whole solve, so the alarm is queued and the handler does not
+            # run until the solve returns on its own. A single call can
+            # therefore ignore the caller's timeout indefinitely: observed on
+            # splice (3005 x 60), where one pair ran for TWO DAYS at 100% CPU
+            # under a nominal 1200s limit. time_limit's own docstring assumed
+            # the slow methods were pure Python/numpy, true before this MILP
+            # path was exercised.
+            opts = {}
+            rem = _remaining()
+            if rem is not None:
+                opts["time_limit"] = rem
             return milp(c_obj, constraints=cons, bounds=bnds,
-                        integrality=np.ones(n_vars))
+                        integrality=np.ones(n_vars), options=opts)
 
         def _relabel_of(x):
             rel = {j: {} for j in range(d)}
@@ -2044,27 +2338,45 @@ class hiceCounterfactuals:
 
         # seed one row per witness, at the pair farthest apart under the
         # IDENTITY relabeling -- the likeliest binding pair before any solve
-        d0 = np.array([[int(np.count_nonzero(A_pts[ap] != B_pts[bi]))
-                        for bi in range(n_B)] for ap in range(n_A)])
-        ap0, b0 = np.unravel_index(int(np.argmax(d0)), d0.shape)
-        for nid in competitor_ids:
+        for nid in block_ids:
+            nb = block_near[nid]
+            d0 = np.array([[int(np.count_nonzero(A_pts[ap] != nb[bi]))
+                            for bi in range(len(nb))] for ap in range(n_A)])
+            ap0, b0 = np.unravel_index(int(np.argmax(d0)), d0.shape)
             for (a_i, c_leaf) in comp_witnesses[nid]:
                 add_dom(nid, a_i, c_leaf, int(ap0), int(b0))
 
         max_rounds, rows_per_round = 64, 64
         converged, rounds, res = False, 0, None
         for rounds in range(1, max_rounds + 1):
+            if time_limit is not None and _time.monotonic() - t_start >= time_limit:
+                return None, {"feasible": False, "rowgen_rounds": rounds,
+                              "rowgen_rows": len(added), "rowgen_converged": False,
+                              "rowgen_timeout": True}
             res = _solve_current()
             if not res.success or res.x is None:
-                # a relaxation proven infeasible proves the full model is too
+                # HiGHS reports both genuine infeasibility and "hit the time
+                # limit with no incumbent" as a failed solve. Only the former
+                # proves the full model infeasible, so when the budget is
+                # exhausted this is reported as a timeout rather than as a
+                # proof that no counterfactual exists.
+                timed_out = (time_limit is not None
+                             and _time.monotonic() - t_start >= time_limit)
                 return None, {"feasible": False, "rowgen_rounds": rounds,
-                              "rowgen_rows": len(added), "rowgen_converged": True}
+                              "rowgen_rows": len(added),
+                              "rowgen_converged": not timed_out,
+                              "rowgen_timeout": timed_out}
             x = res.x
             A_rel = _relabel_of(x)
-            dAB = np.array([[int(np.count_nonzero(A_rel[ap] != B_pts[bi]))
-                             for bi in range(n_B)] for ap in range(n_A)])
+            dAB_by_block = {}
+            for k in block_ids:
+                nb = block_near[k]
+                dAB_by_block[k] = np.array(
+                    [[int(np.count_nonzero(A_rel[ap] != nb[bi]))
+                      for bi in range(len(nb))] for ap in range(n_A)])
             any_added, stalled = False, 0
-            for nid in competitor_ids:
+            for nid in block_ids:
+                dAB = dAB_by_block[nid]
                 sel = [w for w in comp_witnesses[nid]
                        if x[z_col[(nid, w[0], w[1])]] > 0.5]
                 if not sel:

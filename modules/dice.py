@@ -143,6 +143,121 @@ class ConstraintClassifier:
         return np.column_stack([1.0 - p1, p1])
 
 
+class RelabelEncoding:
+    """
+    Flat categorical encoding of a per-coordinate relabelling.
+
+    Under the Hamming metric the admissible move is not a translation but a
+    relabelling: on each coordinate j a function f_j maps every value that A
+    takes there to one target value, applied to all members of A at once. That
+    is not a point in R^d, which is why a translation search (DiCE, BayCon as
+    used for the Euclidean case) has nothing to optimise over.
+
+    It IS, however, a flat vector of CATEGORICAL variables: one slot per
+    (coordinate, source value present in A), whose domain is that coordinate's
+    A-union-B values. That is exactly the input shape dice_ml and BayCon
+    expect, and it is where their native categorical support is finally used.
+
+    Targets are restricted to values appearing in A or B on that coordinate:
+    mapping an A-value to something B never takes can only add distance to B.
+    Identity is therefore always available, so the identity relabelling is a
+    valid query point.
+    """
+
+    def __init__(self, A_pts, B_pts):
+        A = np.asarray(A_pts)
+        B = np.asarray(B_pts)
+        self.d = A.shape[1]
+        self.slots = []          # (coordinate, source value)
+        self.domains = []        # allowed target values, per slot
+        for j in range(self.d):
+            src = sorted({int(v) for v in A[:, j]})
+            tgt = sorted({int(v) for v in A[:, j]} | {int(v) for v in B[:, j]})
+            for a in src:
+                self.slots.append((j, a))
+                self.domains.append(tgt)
+        self.n_slots = len(self.slots)
+
+    def identity(self):
+        """The query point: every value maps to itself."""
+        return np.array([a for (_j, a) in self.slots], dtype=float)
+
+    def feature_names(self):
+        return ["f%d_%d" % (j, a) for (j, a) in self.slots]
+
+    def snap(self, v):
+        """Round a candidate to the nearest legal value in each slot.
+
+        A genetic search may propose values off the domain; snapping keeps
+        every candidate a well-formed relabelling instead of discarding it.
+        """
+        out = np.empty(self.n_slots, dtype=int)
+        for i, x in enumerate(np.asarray(v, dtype=float).ravel()):
+            dom = self.domains[i]
+            out[i] = min(dom, key=lambda c: abs(c - x))
+        return out
+
+    def apply(self, v, A_pts):
+        """Apply the relabelling encoded by v to A."""
+        v = self.snap(v)
+        A = np.asarray(A_pts)
+        out = A.copy()
+        mapping = {}
+        for i, (j, a) in enumerate(self.slots):
+            mapping[(j, a)] = int(v[i])
+        for j in range(self.d):
+            col = A[:, j]
+            out[:, j] = [mapping.get((j, int(x)), int(x)) for x in col]
+        return out
+
+
+class RelabelConstraintClassifier:
+    """
+    ConstraintClassifier for the Hamming relabelling move space.
+
+    Same contract as ConstraintClassifier -- an sklearn-style predict over
+    candidate moves -- but a candidate is a relabelling vector rather than a
+    translation, and the dissimilarity is complete-linkage HAMMING (max over
+    member pairs of the count of differing coordinates) rather than Euclidean.
+    distLinkage hardcodes metric_='euclidean' for 'complete', so scoring
+    categorical candidates through it would compare integer codes with
+    Euclidean geometry.
+    """
+
+    def __init__(self, A_pts, B_pts, comp_pts, eps=0.0, scale=5.0):
+        self.A = np.asarray(A_pts)
+        self.B = np.asarray(B_pts)
+        self.comp = [np.asarray(c) for c in comp_pts]
+        self.eps = eps
+        self.scale = scale
+        self.enc = RelabelEncoding(self.A, self.B)
+
+    @staticmethod
+    def _dmax(P, Q):
+        return float(max(int(np.count_nonzero(p != q)) for p in P for q in Q))
+
+    def _margin(self, v):
+        Ap = self.enc.apply(v, self.A)
+        dB = self._dmax(Ap, self.B)
+        cands = list(self.comp) + [self.A]     # A's unmoved position competes too
+        return min(self._dmax(Ap, X) - dB for X in cands)
+
+    def _margins(self, V):
+        # dice_ml hands us the whole frame row, which carries the padding
+        # column the genetic explainer needs (see run_dice_relabel_multi);
+        # only the leading slot columns are part of the relabelling.
+        V = np.atleast_2d(np.asarray(V, float))[:, :len(self.enc.domains)]
+        return np.array([self._margin(v) for v in V])
+
+    def predict(self, V):
+        return (self._margins(V) > self.eps).astype(int)
+
+    def predict_proba(self, V):
+        m = self._margins(V)
+        p1 = 1.0 / (1.0 + np.exp(-self.scale * m))
+        return np.column_stack([1.0 - p1, p1])
+
+
 # ======================================================================
 # The DiCE baseline runner
 # ======================================================================
@@ -382,3 +497,130 @@ def run_dice_baseline_multi(A_pts, B_pts, comp_pts, linkage, X_all, mu_A=None,
             "method": "dice-genetic",
         }))
     return results
+
+def _relabel_frame(clf, seed, n_rand=400):
+    """
+    Training frame for a search over the relabelling encoding.
+
+    Rows are candidate relabellings: the identity (the query), the min-max
+    relabelling seed, and random draws from each slot's domain. Labelled by
+    the classifier, this gives the search both classes to learn from -- the
+    same role the translation frame plays in the Euclidean wrappers.
+    """
+    import numpy as _np
+    enc = clf.enc
+    rng = _np.random.default_rng(seed)
+    rows = [enc.identity()]
+    try:
+        from modules.hiceCounterfactuals import _hamming_minmax_relabel
+        relabel, _R, _apply = _hamming_minmax_relabel(clf.A, clf.B)
+        rows.append(_np.array([relabel.get(j, {}).get(a, a)
+                               for (j, a) in enc.slots], dtype=float))
+    except Exception:
+        pass
+    for _ in range(n_rand):
+        rows.append(_np.array([rng.choice(dom) for dom in enc.domains], dtype=float))
+    V = _np.vstack(rows)
+    return V, clf.predict(V)
+
+
+def run_dice_relabel_multi(A_pts, B_pts, comp_pts, k=10, eps=0.0, seed=0,
+                           verbose=False):
+    """
+    DiCE over the Hamming RELABELLING move space.
+
+    The Euclidean wrapper hands DiCE a translation t; that is meaningless on
+    categorical codes, where the admissible move is a per-coordinate
+    relabelling. Here the search variable is the relabelling itself, encoded
+    as one CATEGORICAL slot per (coordinate, source value) -- which is what
+    dice_ml's native categorical support expects, and why
+    continuous_features=[] below.
+    """
+    from dice_ml import Dice, Data, Model
+    import pandas as _pd, numpy as _np, random as _random
+    _random.seed(seed); _np.random.seed(seed)
+
+    clf = RelabelConstraintClassifier(A_pts, B_pts, comp_pts, eps=eps)
+    enc = clf.enc
+    V, y = _relabel_frame(clf, seed)
+    if len(set(y.tolist())) < 2:
+        return []                      # nothing valid to learn from
+
+    cols = enc.feature_names()
+    df = _pd.DataFrame(V, columns=cols)
+    # dice_ml's genetic search cannot run on an ALL-categorical frame: its
+    # compute_proximity_loss reshapes the continuous-feature block, which is
+    # empty when continuous_features=[], and dies with
+    #   ValueError: cannot reshape array of size 0 into shape (0)
+    # A single constant continuous column makes that term well-defined (and
+    # identically zero) while the categorical proximity term works normally.
+    # It is excluded from features_to_vary, so it can never be changed and
+    # cannot affect which relabelling is proposed.
+    df["_const"] = 0.0
+    df["valid"] = y
+    data = Data(dataframe=df, continuous_features=["_const"], outcome_name="valid")
+    model = Model(model=clf, backend="sklearn", model_type="classifier")
+    exp = Dice(data, model, method="genetic")
+
+    qd = dict(zip(cols, enc.identity())); qd["_const"] = 0.0
+    q = _pd.DataFrame([qd])
+    out = []
+    try:
+        res = exp.generate_counterfactuals(q, total_CFs=k, desired_class=1,
+                                           features_to_vary=cols,
+                                           verbose=verbose)
+        cfs = res.cf_examples_list[0].final_cfs_df
+        if cfs is not None and len(cfs):
+            for v in cfs[cols].to_numpy(float):
+                if clf.predict([v])[0] != 1:
+                    continue
+                Ap = enc.apply(v, clf.A)
+                out.append((Ap, {"t": enc.snap(v), "feasible": True,
+                                 "found": True, "method": "dice-relabel",
+                                 "distance_moved": float(_np.count_nonzero(
+                                     (Ap != clf.A).any(axis=0)))}))
+    except Exception:
+        return out[:k]
+    return out[:k]
+
+
+def run_baycon_relabel_multi(A_pts, B_pts, comp_pts, k=10, eps=0.0, seed=0):
+    """BayCon over the same relabelling encoding; see run_dice_relabel_multi."""
+    import numpy as _np, random as _random
+    from joblib import parallel_backend
+    import baycon.baycon.bayesian_generator as _bg
+    from baycon.common.DataAnalyzer import DataAnalyzer
+    from baycon.common.Target import Target
+    _random.seed(seed); _np.random.seed(seed)
+
+    clf = RelabelConstraintClassifier(A_pts, B_pts, comp_pts, eps=eps)
+    enc = clf.enc
+    V, y = _relabel_frame(clf, seed)
+    if len(set(y.tolist())) < 2:
+        return {"random": [], "proximal": []}
+
+    names = _np.array(enc.feature_names())
+    target = Target(target_type="classification", target_feature="valid", target_value=1)
+    # every slot is categorical: its domain is a set of labels, not a scale
+    da = DataAnalyzer(V, y, names, target, cat_features=list(names))
+    out = []
+    try:
+        with parallel_backend("threading", n_jobs=1):
+            cands, _ = _bg.run(enc.identity(), 0, target, da, clf)
+        for v in cands:
+            if clf.predict([v])[0] != 1:
+                continue
+            Ap = enc.apply(v, clf.A)
+            out.append((Ap, {"t": enc.snap(v), "feasible": True, "found": True,
+                             "method": "baycon-relabel",
+                             "distance_moved": float(_np.count_nonzero(
+                                 (Ap != clf.A).any(axis=0)))}))
+    except Exception:
+        pass
+    if not out:
+        return {"random": [], "proximal": []}
+    rng = _np.random.default_rng(seed)
+    idx = rng.choice(len(out), size=min(k, len(out)), replace=False)
+    rand = [out[i] for i in idx]
+    prox = sorted(out, key=lambda t: t[1]["distance_moved"])[:k]
+    return {"random": rand, "proximal": prox}

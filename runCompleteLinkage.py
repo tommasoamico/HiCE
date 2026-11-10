@@ -63,6 +63,7 @@ Usage
 
 import argparse
 import csv
+import multiprocessing as mp
 import os
 import time
 
@@ -118,7 +119,20 @@ NA_HAMMING = ("NotApplicable: searches a rigid translation, which is not the "
 # `dB < dX + tol`, absorbing solver rounding at ~1e-11 without weakening the
 # definition. It matters more here than under Ward, because this solver's own
 # eps is a margin on SQUARED distances while validity compares UNSQUARED ones.
-REVALIDATION_TOL = 1e-9
+REVALIDATION_TOL = 1e-6
+# Raised from 1e-9 on 2026-11-01. HiCE minimises proximity, so its solution
+# lands exactly on the strict domination boundary; the feasible set is open,
+# the infimum is attained only in the limit, and a 1e-9 revalidation rejected
+# the returned point as invalid. Measured margins on every affected pair of
+# the Ward run: worst -1.4e-07, median -3.5e-09 absolute (worst relative
+# -3.0e-08) -- Clarabel's interior-point convergence residue. 1e-6 sits
+# comfortably above that noise floor and far below any real violation
+# (metrics.DEGENERATE_TIE_TOL is 1e-3).
+#
+# EUCLIDEAN ONLY. Hamming distances are integers with no rounding noise, and
+# any positive tolerance there turns strict domination into non-strict -- it
+# would count exact ties as valid and overstate validity on categorical data.
+# _reval_eps() pins Hamming to EXACTLY 0.0 and must keep doing so.
 
 
 def _reval_eps(metric):
@@ -148,6 +162,63 @@ def _build_tree(X, metric, linkage):
     return scipy_linkage(X, method=linkage)
 
 
+def _worker(q, args):
+    """Child-process entry point: run one method call and post the result back."""
+    try:
+        q.put(("ok", _run_one(*args)))
+    except Exception as e:                       # noqa: BLE001 - reported, not raised
+        q.put(("err", f"{type(e).__name__}: {e}"))
+
+
+def _run_one_bounded(args, budget):
+    """
+    Run one method call with a HARD wall-clock wall, by running it in a child
+    process and killing the child if it overruns.
+
+    An in-process timer cannot do this. utilityFunctions.time_limit raises from
+    a SIGALRM handler, and Python only runs signal handlers between bytecodes --
+    but scipy.optimize.milp (HiGHS) and Gurobi are C extensions that hold the
+    GIL for the whole solve, so the alarm is queued and never delivered until
+    the solve returns on its own. Passing a limit into the solver helps but is
+    not sufficient either: the model BUILD is unbounded Python work, and on
+    splice (3005 x 60, ~30k witnesses) a nominal 60s budget was still running
+    after 5 minutes. Before any of this, one splice pair ran for TWO DAYS at
+    100% CPU under a nominal 1200s limit.
+
+    Killing a child process is the only mechanism that bounds arbitrary code.
+    Cost: the arguments are pickled across. That is cheap here (the largest is
+    the dataset matrix) relative to a budget measured in minutes. Children run
+    sequentially, so at most one holds a Gurobi WLS session at a time, which
+    matters because the academic licence allows only two.
+
+    Returns (A_prime, info) on success, or raises MethodTimeout / the child's
+    exception so the caller records it exactly as before.
+    """
+    if budget is None:
+        return _run_one(*args)
+    ctx = mp.get_context("fork")                 # fork: no re-import, shares the loaded data
+    q = ctx.Queue()
+    proc = ctx.Process(target=_worker, args=(q, args), daemon=True)
+    proc.start()
+    proc.join(budget)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+        raise MethodTimeout(f"exceeded {budget}s wall-clock limit (hard-killed)")
+    try:
+        status, payload = q.get_nowait()
+    except Exception:
+        raise MethodTimeout(
+            f"child exited without a result (exitcode={proc.exitcode}) "
+            f"within {budget}s")
+    if status == "err":
+        raise RuntimeError(payload)
+    return payload
+
+
 def _pairs_done(out_csv, dataset_label, linkage):
     """Set of (pair_idx, which) already recorded for this (dataset, linkage)."""
     done = set()
@@ -164,14 +235,18 @@ def _pairs_done(out_csv, dataset_label, linkage):
 
 
 def _run_one(which, cf, A_lv, B_lv, A_pts, B_pts, comp_pts, X, metric,
-             linkage, eps, cseed, t_seed):
+             linkage, eps, cseed, t_seed, budget=None):
     """One method, one pair -> (A_prime, info). Raises on solver failure."""
     if which == 'method':
         if metric == 'hamming':
+            # `budget` is passed INTO the solver because the time_limit()
+            # wrapper around this call cannot interrupt HiGHS (a C extension
+            # holding the GIL). Without it a single pair ran for two days on
+            # splice under a nominal 1200s limit.
             return cf.counterfactual_complete_linkage_branch(
-                B_lv, A_lv, metric='hamming', eps=eps)
+                B_lv, A_lv, metric='hamming', eps=eps, time_limit=budget)
         return cf.counterfactual_complete_linkage_branch(
-            B_lv, A_lv, metric='euclidean', eps=eps)
+            B_lv, A_lv, metric='euclidean', eps=eps, time_limit=budget or 60)
 
     if which == 'baseline':
         return cf.baselineCompleteLinkage(B_lv, A_lv)
@@ -258,10 +333,15 @@ def run(dataset, out_csv, linkage, min_leaf, max_leaf, max_pairs,
                 err, A_prime, info = '', None, {}
                 t0 = time.perf_counter()
                 try:
-                    with time_limit(lim):
-                        A_prime, info = _run_one(
-                            which, cf, A_lv, B_lv, A_pts, B_pts, comp_pts,
-                            X, metric, linkage, eps, cseed, t_seed)
+                    # Hard wall via a child process. The in-process time_limit
+                    # is kept as a cheap outer guard for the pickling/startup
+                    # path, but _run_one_bounded is what actually bounds the
+                    # solve -- see its docstring.
+                    with time_limit(lim + 60 if lim else None):
+                        A_prime, info = _run_one_bounded(
+                            (which, cf, A_lv, B_lv, A_pts, B_pts, comp_pts,
+                             X, metric, linkage, eps, cseed, t_seed, lim),
+                            lim)
                 except MethodTimeout as e:
                     err = f"MethodTimeout: {e}"
                 except Exception as e:

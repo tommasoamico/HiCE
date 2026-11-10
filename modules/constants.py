@@ -56,7 +56,7 @@ COMPLETE_FIELDNAMES = FIELDNAMES + [
 # ======================================================================
 DIVERSITY_RAW_FIELDNAMES = [
     'dataset', 'linkage', 'metric', 'pair_idx', 'which', 'base_seed', 'call_seed',
-    'n_A', 'n_B', 'cf_idx', 'valid', 'l2', 'seconds', 'error',
+    'n_A', 'n_B', 'cf_idx', 'valid', 'l2', 'n_feat', 'seconds', 'error',
 ]
 DIVERSITY_SUMMARY_FIELDNAMES = [
     'dataset', 'linkage', 'metric', 'pair_idx', 'which', 'base_seed', 'call_seed',
