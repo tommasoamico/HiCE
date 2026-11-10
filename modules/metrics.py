@@ -87,7 +87,8 @@ def proximity(info, A_orig, A_prime, metric):
                 n_feat=int(np.count_nonzero(np.abs(t) > 1e-9)))
 
 
-def tree_coverage(Z, n, B_node, X, cf_points, metric='euclidean', n_A=None):
+def tree_coverage(Z, n, B_node, X, cf_points, metric='euclidean', n_A=None,
+                  linkage='ward'):
     """
     Top-down tree coverage of target branch B's sub-branches by a set of
     counterfactual points.
@@ -115,7 +116,13 @@ def tree_coverage(Z, n, B_node, X, cf_points, metric='euclidean', n_A=None):
     -------
     (n_represented, n_subbranches) : both 0 if B itself is a leaf.
     """
-    use_ward_weight = (metric != 'hamming') and (n_A is not None)
+    # Routing must use the SAME notion of distance the solver enforced, or a
+    # counterfactual gets credited to the wrong child. Ward compares weighted
+    # CENTROID distances; complete linkage compares the FARTHEST pair, for
+    # which a centroid is not even the right summary of a side. Applying
+    # Ward's rule to complete-linkage results would silently mis-route them.
+    use_ward_weight = (linkage == 'ward') and (metric != 'hamming') and (n_A is not None)
+    use_complete = (linkage == 'complete')
 
     def leaves_of(node):
         if node < n:
@@ -128,7 +135,13 @@ def tree_coverage(Z, n, B_node, X, cf_points, metric='euclidean', n_A=None):
             return float(cdist(p[None, :], q[None, :], metric='hamming')[0, 0] * p.shape[0])
         return float(np.linalg.norm(p - q))
 
-    def side_dist(p, mu_S, n_S):
+    def side_dist(p, mu_S, n_S, S_pts=None):
+        if use_complete and S_pts is not None:
+            # complete linkage: a side's distance is its FARTHEST member
+            if metric == 'hamming':
+                return float(cdist(p[None, :], S_pts, metric='hamming')[0].max()
+                             * p.shape[0])
+            return float(cdist(p[None, :], S_pts, metric='euclidean')[0].max())
         d = raw_dist(p, mu_S)
         if use_ward_weight:
             w = 2.0 * n_A * n_S / (n_A + n_S)
@@ -155,8 +168,10 @@ def tree_coverage(Z, n, B_node, X, cf_points, metric='euclidean', n_A=None):
         # break exact ties toward the left, so every point is always routed.
         left_cfs, right_cfs = [], []
         for c in cfs:
-            dl = side_dist(c, mu_left, n_left)
-            dr = side_dist(c, mu_right, n_right)
+            dl = side_dist(c, mu_left, n_left,
+                           np.asarray(X[left_leaves], dtype=float))
+            dr = side_dist(c, mu_right, n_right,
+                           np.asarray(X[right_leaves], dtype=float))
             tol = 1e-6 * max(1.0, dl, dr)
             if dl <= dr + tol:
                 left_cfs.append(c)
@@ -234,3 +249,101 @@ def sparsity(n_feat, n_total_features):
     if np.isnan(n_feat):
         return np.nan
     return n_feat / n_total_features
+
+
+# ======================================================================
+# Between-branch diversity: junction / specificity coverage
+# ======================================================================
+#
+# The method section describes every counterfactual by two properties of its
+# destination D (method.tex, "To make these distinctions precise"):
+#
+#   junction    lambda(D) -- the smallest branch containing both A and D, i.e.
+#               their lowest common ancestor in the dendrogram. It is the level
+#               at which moving A to D changes the grouping of the query.
+#   specificity delta(D)  -- the number of edges from lambda(D) down to D, so
+#               delta = 1 when D is a child of the junction.
+#
+# Prop. 2 (prop:junction) states every WITHIN-branch alternative of target B
+# shares lambda(B); only BETWEEN-branch alternatives can reach a different
+# junction. These functions make that measurable: a set of counterfactuals
+# covers the hierarchy when it reaches several junctions and several
+# specificities below each.
+
+
+def _parent_map(Z, n):
+    """child node id -> parent node id, for the whole dendrogram."""
+    par = {}
+    for i in range(Z.shape[0]):
+        par[int(Z[i, 0])] = n + i
+        par[int(Z[i, 1])] = n + i
+    return par
+
+
+def junction(Z, n, node_a, node_d, par=None):
+    """
+    lambda(D): the smallest branch containing both A and D.
+
+    Walks A's ancestor chain to the root, then climbs from D until it meets
+    it. The root is in every chain, so this always terminates.
+    """
+    par = _parent_map(Z, n) if par is None else par
+    anc, x = set(), int(node_a)
+    while True:
+        anc.add(x)
+        if x not in par:
+            break
+        x = par[x]
+    y = int(node_d)
+    while y not in anc:
+        y = par[y]
+    return y
+
+
+def specificity(Z, n, lam_node, node_d, par=None):
+    """delta(D): number of edges from the junction down to D (0 iff D == lambda)."""
+    par = _parent_map(Z, n) if par is None else par
+    depth, x = 0, int(node_d)
+    while x != int(lam_node):
+        x = par[x]
+        depth += 1
+    return depth
+
+
+def junction_specificity_coverage(Z, n, node_a, reached_targets, candidate_targets):
+    """
+    Two-dimensional coverage of the hierarchy by a set of counterfactuals.
+
+    reached_targets   : target nodes actually solved for AND valid
+    candidate_targets : every target that was available to be asked for --
+                        the denominator, so a method is never credited for
+                        a cell it was never offered.
+
+    Returns cell / junction / specificity coverage. "Cells" are distinct
+    (lambda, delta) pairs: the headline number, analogous to tree coverage.
+    """
+    par = _parent_map(Z, n)
+
+    def cell(dnode):
+        lam = junction(Z, n, node_a, dnode, par)
+        return (lam, specificity(Z, n, lam, dnode, par))
+
+    avail = {cell(d) for d in candidate_targets}
+    got = {cell(d) for d in reached_targets} & avail
+    j_avail = {c[0] for c in avail}
+    j_got = {c[0] for c in got}
+    # specificity spread is only meaningful inside a junction, so average the
+    # per-junction fractions over the junctions actually offered
+    spec = []
+    for lam in j_avail:
+        a = {c[1] for c in avail if c[0] == lam}
+        g = {c[1] for c in got if c[0] == lam}
+        if a:
+            spec.append(len(g) / len(a))
+    return dict(
+        cells_reached=len(got), cells_available=len(avail),
+        cell_coverage=(len(got) / len(avail)) if avail else float('nan'),
+        junctions_reached=len(j_got), junctions_available=len(j_avail),
+        junction_coverage=(len(j_got) / len(j_avail)) if j_avail else float('nan'),
+        specificity_coverage=(float(np.mean(spec)) if spec else float('nan')),
+    )

@@ -1,14 +1,177 @@
 from typing import List, Dict, Iterable
 import numpy as np
-from modules.utilityFunctions import project_sphere_closed_form, project_single_sphere_sdp, active, feasible, unit, ward_info, complete_linkage_max, get_children
+from modules.utilityFunctions import project_sphere_closed_form, project_single_sphere_sdp, active, feasible, unit, ward_info, complete_linkage_max, get_children, _dominates
 import miniball
 from scipy.spatial.distance import cdist
 from scipy.optimize import  milp, LinearConstraint, Bounds
+from scipy.sparse import coo_matrix
 import gurobipy as gp
 from gurobipy import GRB
 import cvxpy as cp
 from scipy.optimize import minimize
 from itertools import combinations
+import time as _time
+
+
+def _hamming_minmax_relabel(A_pts, B_pts):
+    """
+    Complete-linkage Hamming BASELINE: the rigid relabeling of A that
+    minimises A's FARTHEST Hamming distance to B, ignoring competitors.
+
+    This is the categorical counterpart of the Euclidean MEB baseline
+    (t* = -center(MEB(V_AB))): same role, same "min-max, competitors
+    ignored" semantics, so the achieved distance is the feasibility FLOOR
+    min_t d(A(t), B). If even this cannot beat a competitor, the pair's
+    counterfactual region is plausibly empty rather than the solver having
+    failed.
+
+    Move
+    ----
+    Per coordinate j a single function f_j is applied to EVERY point of A:
+    each source value alpha that A takes on j maps to one target value beta.
+    No bijection is required (two A-values may collapse onto one target).
+    This is the same move class as _solve_branch_hamming -- binary XOR is the
+    two-value special case -- and it is what keeps A a valid node: equal
+    A-values stay equal because f_j is a well-defined function.
+
+    Formulation (exact MILP, solved with scipy/HiGHS -- no licence needed)
+    --------------------------------------------------------------------
+    With indicators y[j, alpha, beta] = 1 iff f_j(alpha) = beta, Hamming
+    distance is affine:
+
+        d_H(f(a), b) = sum_j (1 - y[j, a_j, b_j]) = d - sum_j y[j, a_j, b_j]
+
+    so bounding the worst pair by an epigraph variable h gives
+
+        min  h + w * sum_j moved_j
+        s.t. sum_beta y[j, alpha, beta] = 1          for each (j, alpha)
+             sum_j y[j, a_j, b_j] + h >= d           for each (a, b) in AxB
+             moved_j + y[j, alpha, alpha] >= 1       for each (j, alpha)
+             y, moved binary;  0 <= h <= d
+
+    The `moved_j` term breaks ties toward relabeling FEWER coordinates. It
+    cannot disturb the min-max optimum: h takes integer values in unit
+    steps, and w is chosen so w * d < 1, so no tie-break can ever buy a
+    reduction in h. Without it the solver returns an arbitrary member of a
+    frequently large optimal set, which made the baseline non-deterministic
+    and needlessly dense.
+
+    Targets per coordinate are restricted to the values appearing in A or B
+    on that coordinate: mapping an A-value to something B never takes can
+    only ever add distance to B. Identity is therefore always available
+    (every source value is also a target), so "keep as-is" is always
+    feasible and the problem is never infeasible -- unlike the
+    competitor-constrained solve.
+
+    Returns
+    -------
+    relabel : {j: {alpha: beta}}
+        Per-coordinate relabeling map, matching the `info['t']` convention
+        of _solve_branch_hamming.
+    R : int
+        Achieved max Hamming distance from the relabeled A to B, in
+        coordinates (the feasibility floor).
+    apply : callable
+        apply(A_in) -> relabeled copy of A_in, for reusing the same f on
+        other rows.
+    """
+    A = np.asarray(A_pts)
+    B = np.asarray(B_pts)
+    n_A, d = A.shape
+
+    src = [sorted({int(v) for v in A[:, j]}) for j in range(d)]
+    tgt = [sorted({int(v) for v in A[:, j]} | {int(v) for v in B[:, j]})
+           for j in range(d)]
+
+    # ---- variable layout: y[j,alpha,beta], then moved_j, then h ----
+    ycol, col = {}, 0
+    for j in range(d):
+        for al in src[j]:
+            for be in tgt[j]:
+                ycol[(j, al, be)] = col
+                col += 1
+    mcol = {}
+    for j in range(d):
+        mcol[j] = col
+        col += 1
+    hcol = col
+    n_vars = col + 1
+
+    w = 1.0 / (2.0 * d + 1.0)          # w * d < 1, so h always dominates
+    c_obj = np.zeros(n_vars)
+    c_obj[hcol] = 1.0
+    for j in range(d):
+        c_obj[mcol[j]] = w
+
+    rows, lo, hi = [], [], []
+
+    # f_j is a function: exactly one target per source value
+    for j in range(d):
+        for al in src[j]:
+            r = np.zeros(n_vars)
+            for be in tgt[j]:
+                r[ycol[(j, al, be)]] = 1.0
+            rows.append(r); lo.append(1.0); hi.append(1.0)
+
+    # every A-B pair within h:  sum_j y[j,a_j,b_j] + h >= d
+    for a in A:
+        for b in B:
+            r = np.zeros(n_vars)
+            for j in range(d):
+                r[ycol[(j, int(a[j]), int(b[j]))]] += 1.0
+            r[hcol] = 1.0
+            rows.append(r); lo.append(float(d)); hi.append(np.inf)
+
+    # moved_j = 1 if any source value on j is not kept
+    for j in range(d):
+        for al in src[j]:
+            r = np.zeros(n_vars)
+            r[mcol[j]] = 1.0
+            r[ycol[(j, al, al)]] = 1.0
+            rows.append(r); lo.append(1.0); hi.append(np.inf)
+
+    constraints = LinearConstraint(np.array(rows), lo, hi)
+    integrality = np.ones(n_vars)
+    integrality[hcol] = 0                      # h is continuous (integral at opt)
+    ub = np.ones(n_vars)
+    ub[hcol] = float(d)
+    bounds = Bounds(lb=np.zeros(n_vars), ub=ub)
+
+    # Bounded for the same reason as _solve_branch_hamming's solve: a
+    # SIGALRM-based timeout cannot interrupt HiGHS, so the limit must be passed
+    # in. Identity is always feasible here, so exhausting the budget degrades
+    # to the identity relabeling rather than to a wrong answer.
+    res = milp(c_obj, constraints=constraints, bounds=bounds,
+               integrality=integrality, options={"time_limit": 300.0})
+    if not res.success or res.x is None:
+        # Identity is always feasible, so this means a solver failure rather
+        # than genuine infeasibility; fall back to the identity relabeling so
+        # the caller still gets a well-formed baseline it can score.
+        relabel = {j: {al: al for al in src[j]} for j in range(d)}
+    else:
+        x = res.x
+        relabel = {}
+        for j in range(d):
+            m = {}
+            for al in src[j]:
+                best = max(tgt[j], key=lambda be: x[ycol[(j, al, be)]])
+                m[al] = best
+            relabel[j] = m
+
+    def apply(A_in):
+        A_in = np.asarray(A_in)
+        out = A_in.copy()
+        for j in range(A_in.shape[1]):
+            mj = relabel.get(j, {})
+            for row in range(A_in.shape[0]):
+                v = int(A_in[row, j])
+                if v in mj:
+                    out[row, j] = mj[v]
+        return out
+
+    A_rel = apply(A)
+    R = int(max(int(np.count_nonzero(a != b)) for a in A_rel for b in B))
+    return relabel, R, apply
 
 
 class hiceCounterfactuals:
@@ -556,7 +719,8 @@ class hiceCounterfactuals:
     def _solve_ward_core(self, A_pts, mu_A, mu_B, E, free_idx, fixed_idx, k_free,
                           convex_ball_in, convex_half, rev_balls,
                           sparsity, lam, use_sparsity, allowed_features,
-                          n_competitors, d, socp_solver, exhaustive, index_to_name):
+                          n_competitors, d, socp_solver, exhaustive, index_to_name,
+                          phase_probe=False):
         """
         Phase 1-4 solve logic of counterfactual_ward_branch, extracted to
         operate on already-built Apollonius data (convex_ball_in/convex_half/
@@ -716,6 +880,23 @@ class hiceCounterfactuals:
             return _finish(p, "phase3-greedy", not use_sparsity)
 
         # ---------------- Phase 4: active-set enumeration ----------------
+        # PHASE PROBE: when we only want to know WHICH phase a solve reaches,
+        # stop here. Phase 4 is the combinatorial part -- it enumerates
+        # combinations(rev_balls, k) and is what makes hard pairs explode --
+        # and running it changes nothing about the answer to "which phase did
+        # this reach". Returning mu_B, the same guaranteed-feasible fallback
+        # phase 4 itself uses when enumeration finds nothing, keeps the
+        # diversity descent moving at negligible cost.
+        #
+        # Fidelity caveat: the returned point is NOT the phase-4 optimum, so
+        # any solve DOWNSTREAM of a probed node sees a different incumbent
+        # than the real run would. The first phase-4 entry on each path is
+        # faithful; phases recorded after one are indicative only. That is
+        # enough for the question this probe exists to answer -- whether the
+        # expensive pairs reach phase 4 at all.
+        if phase_probe:
+            return _finish(mu_B.copy(), "phase4-entered", False)
+
         kmax = min(d, len(rev_balls))
         best_p, best_val = None, np.inf
         for k in range(1, kmax + 1):
@@ -740,7 +921,8 @@ class hiceCounterfactuals:
         return _finish(best_p, phase, opt)
 
     def diverseCounterfactuals(self, B_leaves, A_leaves, max_depth=None,
-                                both_children=False, **kwargs):
+                                both_children=False, include_leaf_targets=True,
+                                **kwargs):
         """
         Hierarchical diverse counterfactuals for Ward-linkage: descend B's own
         dendrogram subtree. The original "under B" domination constraints
@@ -793,6 +975,19 @@ class hiceCounterfactuals:
             the parent CF. If True, descend into both children at every
             internal node, producing one counterfactual per node of B's
             subtree.
+        include_leaf_targets : bool
+            If True (default), a child that is itself a single leaf still
+            gets its own sibling-preference-constrained solve, exactly like
+            a branch child. If False, descent stops one level early: a leaf
+            child is never solved for or added to `results` (its sibling-
+            preference constraint isn't even built). Leaf targets can never
+            count as a represented sub-branch (a "sub-branch" requires >=2
+            leaves -- see metrics.tree_coverage_from_targets), so a caller
+            that only cares about sub-branch coverage (e.g. runHierarchical.
+            py's diversity experiment) can set this False to both skip
+            wasted solver calls on nodes whose result could never be used
+            for coverage, and guarantee every returned candidate is
+            coverage-eligible.
         **kwargs
             Forwarded to counterfactual_ward_branch (e.g. eps, sparsity, lam,
             index_to_name, socp_solver, allowed_features).
@@ -851,7 +1046,8 @@ class hiceCounterfactuals:
                 A_pts, mu_A, mu_B, E, free_idx, fixed_idx, k_free,
                 convex_ball_in, convex_half, rev_balls,
                 sparsity, lam, use_sparsity, allowed_features,
-                n_base_competitors + n_extra, d, socp_solver, exhaustive, index_to_name)
+                n_base_competitors + n_extra, d, socp_solver, exhaustive, index_to_name,
+                phase_probe=kwargs.get('phase_probe', False))
 
         def new_constraint_satisfied(kind, idx, p, tol=1e-6):
             # Feasibility test for exactly the ONE newly-accumulated sibling
@@ -926,6 +1122,11 @@ class hiceCounterfactuals:
             t_here, optimal_here = info["t"], info.get("optimal", False)
 
             def descend(child, child_leaves, sibling_node, sibling_leaves, path_pair):
+                if not include_leaf_targets and child < self.n:
+                    # Leaf child: no sub-branch to represent and nothing to
+                    # descend into further, so skip the solve entirely
+                    # rather than compute and then discard it.
+                    return
                 # Sibling-preference constraint: d(A, child) < d(A, sibling),
                 # built with child's OWN centroid/weight as "near" (not B's)
                 # -- see diverseCounterfactuals' docstring for why this,
@@ -960,11 +1161,209 @@ class hiceCounterfactuals:
         visit(B_node, 0, [], 0, None, False, None)
         return results
 
+    def diverseCounterfactualsComplete(self, B_leaves, A_leaves, max_depth=None,
+                                        both_children=True, include_leaf_targets=False,
+                                        **kwargs):
+        """
+        Complete-linkage counterpart of diverseCounterfactuals: descend B's own
+        dendrogram subtree, specialising the counterfactual to one sub-branch
+        at a time, while keeping the original "A is under B" domination
+        constraints at every node.
+
+        The recipe is identical in spirit to Ward's; only the encoding of the
+        one sibling-preference comparison differs, because complete-linkage
+        distance is a MAX over pairs rather than a single centroid distance:
+
+            d(A(t), child) < d(A(t), sibling)
+
+        Under Ward this collapses to one Apollonius surface. Under complete
+        linkage it does not -- it becomes the same existential the base
+        domination constraints already use:
+
+            EXISTS q in V_{A, sibling} such that
+                ||q + t|| >= ||p + t|| + eps   for ALL p in V_{A, child}
+
+        which is exact (if the sibling's max exceeds the child's, the
+        sibling's own argmax witnesses it; conversely any such q forces it).
+        So each level of descent contributes exactly one more witness-
+        disjunction BLOCK -- near = the target child, far = its sibling --
+        carried through `extra_blocks` into the MIQP. That hook exists for
+        precisely this; the solver itself needs no change.
+
+        Note the near-set of a sibling block is V_{A, child}, NOT V_{A, B}.
+        That is why _cl_block keeps its own P per block rather than sharing
+        one global P the way the original enumeration-era code did.
+
+        Differences from Ward worth knowing:
+
+        * Ward is always feasible; complete linkage is not. A spread-out child
+          may be genuinely undominatable against its sibling, so infeasible
+          nodes are expected rather than a symptom, and they prune the subtree
+          below them (feasible regions are nested and shrink with depth).
+        * There is no "inherited-parent" shortcut. Ward can reuse a parent's
+          solution when the one new constraint is already satisfied, because
+          the parent's point is provably optimal for the smaller region. Here
+          the new constraint is a disjunction whose satisfaction depends on
+          which witness is selected, so that argument does not carry; every
+          node is solved. This makes the descent markedly more expensive than
+          Ward's, which is why the per-call budget matters.
+
+        Parameters mirror diverseCounterfactuals. `both_children=True` and
+        `include_leaf_targets=False` default to the settings the Ward
+        diversity experiment ended up using: descend into both children, and
+        do not spend a solve on a leaf target, which can never count as a
+        represented sub-branch.
+
+        Returns a list of dicts with target_node / path / A_prime / info /
+        depth, exactly like diverseCounterfactuals, so the same downstream
+        scoring (notably metrics.tree_coverage_from_targets, which is
+        linkage-agnostic because it matches target-node identity rather than
+        routing geometrically) applies unchanged.
+        """
+        A_node, A_leaves_sorted, _s_A = self._resolve_branch(A_leaves)
+        B_node, B_leaves_sorted, _s_B = self._resolve_branch(B_leaves)
+        if A_node == B_node:
+            raise ValueError("A_leaves and B_leaves resolve to the same node.")
+        A_pts = np.asarray(self.X[A_leaves_sorted], dtype=float)
+        d = A_pts.shape[1]
+
+        solver_kw = {k: v for k, v in kwargs.items()
+                     if k in ("eps", "index_to_name", "t_bound", "time_limit",
+                              "verbose", "sparsity", "lam", "allowed_features",
+                              "max_rounds", "rows_per_round")}
+
+        def sibling_block(child_leaves, sibling_node, sibling_leaves):
+            """One witness-disjunction block: near = child, far = sibling."""
+            C = np.asarray(self.X[child_leaves], dtype=float)
+            S = np.asarray(self.X[sibling_leaves], dtype=float)
+            P = (A_pts[:, None, :] - C[None, :, :]).reshape(-1, d)
+            Q = (A_pts[:, None, :] - S[None, :, :]).reshape(-1, d)
+            labels = [lf for _a in range(len(A_pts)) for lf in sibling_leaves]
+            return self._cl_block(("sibling", sibling_node), P, Q, labels)
+
+        results = []
+
+        def visit(node, depth, path, blocks):
+            A_prime, info = self.counterfactual_complete_linkage_branch_gurobi(
+                B_leaves, A_leaves, metric='euclidean',
+                extra_blocks=blocks, **solver_kw)
+            results.append({"target_node": node, "path": list(path),
+                            "A_prime": A_prime, "info": info, "depth": depth})
+            if not info.get("feasible", False):
+                return                      # nested regions: prune the subtree
+            if max_depth is not None and depth >= max_depth:
+                return
+            children = get_children(self.Z, self.n, node)
+            if children is None:
+                return
+            c_left, c_right = children
+            lv_l, lv_r = self.get_leaves(c_left), self.get_leaves(c_right)
+
+            def descend(child, child_leaves, sib, sib_leaves):
+                if not include_leaf_targets and child < self.n:
+                    return                  # a leaf can never be a sub-branch
+                visit(child, depth + 1, path + [(child, sib)],
+                      blocks + [sibling_block(child_leaves, sib, sib_leaves)])
+
+            if both_children:
+                descend(c_left, lv_l, c_right, lv_r)
+                descend(c_right, lv_r, c_left, lv_l)
+            else:
+                descend(c_left, lv_l, c_right, lv_r)
+
+        visit(B_node, 0, [], [])
+        return results
+
+    def diverseCounterfactualsCompleteHamming(self, B_leaves, A_leaves,
+                                               max_depth=None, both_children=True,
+                                               include_leaf_targets=False,
+                                               eps=1e-6, time_limit=None,
+                                               index_to_name=None):
+        """
+        Hamming counterpart of diverseCounterfactualsComplete.
+
+        Identical recipe -- descend B's subtree, keep the original "A is under
+        B" constraints, and add one sibling-preference requirement per level:
+
+            d(A(f), child) < d(A(f), sibling)
+
+        Under Hamming this is again a witness disjunction, but it rides on the
+        SAME relabeling variables y[j, alpha, beta] as everything else, because
+        the move is one shared f applied to all of A. Expanding
+        d_H(f(a), p) = d - sum_j y[j, a_j, p_j], the requirement becomes a row
+        that is affine in y:
+
+            sum_j y[j, a'_j, r_j] - sum_j y[j, a_i_j, l_j] >= eps
+
+        for every (a', r) with r in the target child, where (a_i, l) is the
+        selected witness from the sibling. That is the same affine form the
+        base competitor rows already use, with the child as the near set and
+        the sibling as the far set -- so it enters as one more BLOCK, which is
+        exactly what _solve_branch_hamming's extra_blocks takes.
+
+        Target values need no extension: both children are subsets of B, whose
+        values are already in tgt_vals, so no new y variables are created --
+        only witness binaries.
+
+        As in the Euclidean complete-linkage descent, there is no
+        inherited-parent shortcut and nodes can be genuinely infeasible, which
+        prunes the subtree beneath them.
+        """
+        A_node, A_leaves_sorted, s_A = self._resolve_branch(A_leaves)
+        B_node, B_leaves_sorted, s_B = self._resolve_branch(B_leaves)
+        if A_node == B_node:
+            raise ValueError("A_leaves and B_leaves resolve to the same node.")
+        A_pts = np.asarray(self.X[A_leaves_sorted])
+        B_pts = np.asarray(self.X[B_leaves_sorted])
+
+        live = self._alive_clusters_before_row(min(s_A, s_B) + 1)
+        A_set, B_set = set(A_leaves_sorted), set(B_leaves_sorted)
+        competitor_nodes = {nid: lv for nid, lv in live.items()
+                            if not (set(lv) <= A_set or set(lv) <= B_set)}
+        competitor_nodes["__A_unmoved__"] = A_leaves_sorted
+
+        results = []
+
+        def visit(node, depth, path, blocks):
+            A_prime, info = self._solve_branch_hamming(
+                A_pts, B_pts, competitor_nodes, eps, None, index_to_name,
+                time_limit=time_limit, extra_blocks=blocks)
+            results.append({"target_node": node, "path": list(path),
+                            "A_prime": A_prime, "info": info, "depth": depth})
+            if not info.get("feasible", False):
+                return
+            if max_depth is not None and depth >= max_depth:
+                return
+            children = get_children(self.Z, self.n, node)
+            if children is None:
+                return
+            c_left, c_right = children
+            lv_l, lv_r = self.get_leaves(c_left), self.get_leaves(c_right)
+
+            def descend(child, child_leaves, sib, sib_leaves):
+                if not include_leaf_targets and child < self.n:
+                    return
+                blk = (("sibling", sib),
+                       np.asarray(self.X[sorted(child_leaves)]),
+                       sorted(sib_leaves))
+                visit(child, depth + 1, path + [(child, sib)], blocks + [blk])
+
+            if both_children:
+                descend(c_left, lv_l, c_right, lv_r)
+                descend(c_right, lv_r, c_left, lv_l)
+            else:
+                descend(c_left, lv_l, c_right, lv_r)
+
+        visit(B_node, 0, [], [])
+        return results
+
     def counterfactual_complete_linkage_branch(self, B_leaves, A_leaves,
                                             metric='euclidean', anchor='min',
                                             eps=1e-6, index_to_name=None,
                                             big_m=None,
-                                            t_bound=1e4, time_limit=60, verbose=False):
+                                            t_bound=1e4, time_limit=60, verbose=False,
+                                            sparsity=False, lam=1.0,
+                                            allowed_features=None, extra_blocks=None):
         """
         Complete-linkage counterfactual that moves an entire branch A 
         so that it would attach under branch B instead of
@@ -1088,7 +1487,8 @@ class hiceCounterfactuals:
 
         # Guard 1: no competitors at all -> every t is feasible, nothing to beat.
         if not competitor_nodes:
-            print("No live competitors at s* — every t is feasible; returning t*=0.")
+            if verbose:
+                print("No live competitors at s* — every t is feasible; returning t*=0.")
             return A_pts.copy(), {
                 "t": np.zeros(self.d), "feasible": True, "distance_moved": 0.0,
                 "n_competitors": 0, "already_optimal": True,
@@ -1099,7 +1499,8 @@ class hiceCounterfactuals:
         dAX0:Dict[int, float] = {nid: complete_linkage_max(A_pts, np.asarray(self.X[leaves], dtype=float), metric)
                 for nid, leaves in competitor_nodes.items()} # Distance between A and every competitor X_0
         if all(dAB0 < dx - eps for dx in dAX0.values()):
-            print("A already dominates B against every competitor at t=0; returning t*=0.")
+            if verbose:
+                print("A already dominates B against every competitor at t=0; returning t*=0.")
             return A_pts.copy(), {
                 "t": np.zeros(self.d), "feasible": True, "distance_moved": 0.0,
                 "n_competitors": len(competitor_nodes), "already_optimal": True,
@@ -1121,10 +1522,15 @@ class hiceCounterfactuals:
             A_prime, info = self.counterfactual_complete_linkage_branch_gurobi(
                 B_leaves, A_leaves, anchor=anchor, eps=eps,
                 index_to_name=index_to_name, t_bound=t_bound, time_limit=time_limit,
-                verbose=verbose)
+                verbose=verbose, sparsity=sparsity, lam=lam,
+                allowed_features=allowed_features, extra_blocks=extra_blocks)
         elif metric == 'hamming':
+            # time_limit is forwarded, not just accepted: the hamming path is
+            # a C-extension MILP that a SIGALRM wrapper cannot interrupt, so
+            # this is the only limit that actually binds it.
             A_prime, info = self._solve_branch_hamming(
-                A_pts, B_pts, competitor_nodes, eps, big_m, index_to_name)
+                A_pts, B_pts, competitor_nodes, eps, big_m, index_to_name,
+                time_limit=time_limit)
         else:
             raise ValueError(f"Unsupported metric: {metric!r}; use 'euclidean' or 'hamming'.")
 
@@ -1132,16 +1538,18 @@ class hiceCounterfactuals:
         # Step 5 — output and checks.
         # ---------------------------------------------------------------
         if not info.get("feasible", False):
-            print("\nFeasible                  : False")
-            print("No t satisfies the complete-linkage margin against every live "
-                "competitor — the counterfactual region can be genuinely empty "
-                "for complete linkage (a spatially large/spread B is not "
-                "necessarily dominatable).")
+            if verbose:
+                print("\nFeasible                  : False")
+                print("No t satisfies the complete-linkage margin against every live "
+                    "competitor — the counterfactual region can be genuinely empty "
+                    "for complete linkage (a spatially large/spread B is not "
+                    "necessarily dominatable).")
             info["n_competitors"] = len(competitor_nodes)
             return None, info
 
         moved_norm = info.get("distance_moved", info.get("bits_flipped"))
-        print(f"\nFeasible                  : True")
+        if verbose:
+            print(f"\nFeasible                  : True")
         #print(f"||t*|| / bits flipped     : {moved_norm}")
         #print(f"Active (binding) witnesses: {info.get('binding_witnesses')}")
 
@@ -1193,97 +1601,184 @@ class hiceCounterfactuals:
         return {node_id: node_leaves[node_id] for node_id in alive}
 
 
-    '''def counterfactual_complete_linkage_branch_gurobi(
-        self, B_leaves, A_leaves,
-        metric='euclidean', anchor='min', eps=1e-6,
-        index_to_name=None, t_bound=1e4, time_limit=60, verbose=False):
+    # ------------------------------------------------------------------
+    # Complete-linkage Euclidean solver: witness-disjunction blocks
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cl_block(key, P_pts, Q_pts, q_labels):
         """
-        Branch-aware complete-linkage counterfactual, solved as a *convex* MIQP
-        with Gurobi.
+        One witness-disjunction block for the complete-linkage MIQP.
 
-        Instead of enumerating one witness per competitor and 
-        solving a QP per assignment (exponential in the number of competitors),
-        we hand the whole disjunctive problem to a branch-and-bound solver as a
-        single convex MIQP. Two deliberate design choices:
+        A block encodes a single complete-linkage domination requirement
+        "d(A(t), near) < d(A(t), far)", in the form that complete linkage's
+        max-over-pairs forces:
 
-        1. SQUARED-AND-LINEARISED domination.  The complete-linkage domination
-            inequality  ||q + t|| >= ||p + t||  is squared, which cancels the
-            ||t||^2 term and leaves a *linear* row in t:
+            EXISTS a witness q in V_{A,far} such that
+                ||q + t|| >= ||p + t|| + margin   for ALL p in V_{A,near}.
 
-                2 <p - q, t>  <=  ||q||^2 - ||p||^2 - eps.
+        That existential is exact, not merely sufficient: if the far side's
+        max exceeds the near side's, the far side's own argmax witnesses it;
+        conversely any such q makes max_far >= max_near. So one block per
+        requirement reproduces the requirement exactly.
 
-            So the objective stays convex quadratic (min ||t||^2) and every
-            constraint is linear -> a CONVEX MIQP.  This is exactly the regime
-            MIQP branch-and-bound solver is efficient on, and (crucially) a
-            convex MIQP is solved to certified GLOBAL optimality.
-
-        Both A and B may be single leaves or full internal subtrees.  A is
-        translated rigidly (one shared t applied to every point of A), which is
-        why the domination must hold against the FULL difference set V_AB (every
-        a in A paired with every b in B), not just a per-point slice.
-
-        The disjunction "some witness q in V_AX dominates every p in V_AB" is
-        encoded with one binary z per (competitor, witness pair) and
-        sum(z) >= 1 per competitor.  Each domination row is deactivated when its
-        binary is 0 via a big-M term (M z on the <= side, so z=0 makes the row
-        vacuous and z=1 makes it bind).  A valid finite M is derived per row from
-        the t-box, so no manual tuning is needed.
+        Keeping `P` *per block* (rather than one P shared by every block, as
+        the original enumeration-era code assumed) is what lets the diversity
+        descent reuse this machinery: a base competitor block has
+        near = B, far = competitor, while a sibling-preference block has
+        near = the target child, far = its sibling -- same algebra, different
+        near-set. See counterfactual_complete_linkage_branch_gurobi.
 
         Parameters
         ----------
-        B_leaves : list of int
-            Leaf indices of the target branch B (passed first, matching the other
-            branch functions).
-        A_leaves : list of int
-            Leaf indices of the branch A to move.  A single leaf is the n_A = 1
-            special case.
-        X : np.ndarray
-            Data matrix (rows = leaves), continuous features for metric='euclidean'.
-        Z : np.ndarray
-            SciPy linkage matrix (build it with a Euclidean metric so competitor
-            structure is consistent with the L2 geometry solved here).
+        key : hashable
+            Block identifier, used in Gurobi constraint names and to report
+            which blocks are binding (a competitor node id, or e.g.
+            ('sibling', child, sibling)).
+        P_pts : (m, d) array
+            Difference set V_{A,near}: every p that the chosen witness must
+            out-distance.
+        Q_pts : (w, d) array
+            Difference set V_{A,far}: the candidate witnesses.
+        q_labels : list of length w
+            Per-witness provenance (leaf index or label), for diagnostics.
+        """
+        P_pts = np.asarray(P_pts, dtype=float)
+        Q_pts = np.asarray(Q_pts, dtype=float)
+        return {
+            "key": key,
+            "P": P_pts,
+            "pp": np.einsum('ij,ij->i', P_pts, P_pts),
+            "Q": Q_pts,
+            "qq": np.einsum('ij,ij->i', Q_pts, Q_pts),
+            "labels": list(q_labels),
+        }
+
+    def _cl_pair_blocks(self, A_pts, near_pts, far_nodes):
+        """
+        Build one _cl_block per entry of `far_nodes` (a {key: leaves} dict),
+        all sharing the same near-set `near_pts`. This is the base
+        "A must stay closer to near than to every competitor" requirement.
+        """
+        P = (A_pts[:, None, :] - np.asarray(near_pts, dtype=float)[None, :, :]
+             ).reshape(-1, A_pts.shape[1])
+        blocks = []
+        for key, leaves in far_nodes.items():
+            C = np.asarray(self.X[leaves], dtype=float)
+            Q = (A_pts[:, None, :] - C[None, :, :]).reshape(-1, A_pts.shape[1])
+            labels = [leaf for _a in range(len(A_pts)) for leaf in leaves]
+            blocks.append(self._cl_block(key, P, Q, labels))
+        return blocks
+
+    def counterfactual_complete_linkage_branch_gurobi(
+        self, B_leaves, A_leaves,
+        metric='euclidean', anchor='min', eps=1e-6,
+        index_to_name=None, t_bound=1e4, time_limit=60, verbose=False,
+        sparsity=False, lam=1.0, allowed_features=None,
+        extra_blocks=None, max_rounds=64, rows_per_round=64):
+        """
+        Branch-aware complete-linkage counterfactual, solved as a *convex*
+        MIQP with Gurobi plus constraint row generation.
+
+        Formulation
+        -----------
+        The complete-linkage domination inequality ||q + t|| >= ||p + t|| is
+        SQUARED, which cancels ||t||^2 and leaves a LINEAR row in t:
+
+            2 <p - q, t>  <=  ||q||^2 - ||p||^2 - eps.
+
+        So the objective stays convex quadratic and every constraint is
+        linear -> a convex MIQP, which branch-and-bound solves to certified
+        GLOBAL optimality. This is why the squared-linearised form is kept
+        rather than an epigraph form on d(A,B): the epigraph version makes
+        the row count additive instead of multiplicative, but turns the
+        witness rows reverse-convex and forfeits exactly that guarantee.
+
+        The price of linearisation is that the full model has one row per
+        (block, witness, p) triple, i.e. |Q| * |P| rows per block. That is
+        multiplicative and can reach millions of rows on wide branches
+        (n_A enters squared, since it sizes both P and Q), so the rows are
+        generated LAZILY:
+
+          1. seed one row per (block, witness) -- the p of largest norm,
+             the most likely binding one at t ~ 0;
+          2. solve;
+          3. for each block, if no selected witness satisfies all of its
+             rows, add the violated rows of the least-violated selected
+             witness;
+          4. repeat until no block is violated.
+
+        On termination with nothing violated the solution is feasible for
+        the FULL model, and since the generated model is a relaxation of it
+        (a subset of its rows), the relaxation's optimum attained at a
+        full-model-feasible point IS the full-model optimum. Global
+        optimality therefore survives row generation. If `max_rounds` is
+        exhausted with violations outstanding, info['optimal'] is False and
+        info['rowgen_converged'] is False.
+
+        Both A and B may be single leaves or full subtrees; A is translated
+        rigidly by one shared t, which is why domination must hold against
+        the FULL difference set V_AB (every a in A against every b in B),
+        not a per-point slice.
+
+        Parameters
+        ----------
+        B_leaves, A_leaves : list of int
+            Target branch B and the branch to move, as elsewhere.
         metric : {'euclidean'}
-            Only Euclidean is supported here; the squared-domination trick is L2
-            specific.  (Hamming has its own MILP function.)
+            Euclidean only; the squared-domination trick is L2 specific.
+            Hamming has its own exact MILP (_solve_branch_hamming).
         anchor : {'min'}
-            Competitor anchor step s* = min(s_A, s_B); only 'min' is implemented.
+            Competitor anchor step s* = min(s_A, s_B).
         eps : float
-            Strict-domination margin (keeps "strictly closer than every
-            competitor" well-defined and the feasible region closed).
-        index_to_name : dict, optional
-            index -> label, for readable diagnostics only.
+            Strict-domination margin. NOTE: this margin is on SQUARED
+            distances here, whereas metrics.validity / _dominates apply eps
+            to UNSQUARED distances. The two are not interchangeable; the
+            returned info carries `margin_unsquared` from an independent
+            _dominates re-check so a caller can revalidate on the same
+            footing it uses for every other method.
         t_bound : float
-            Box bound |t_j| <= t_bound.  Keeps the model finite and supplies the
-            big-M.  Hitting the box is a signal the region may be unbounded.
+            Box bound |t_j| <= t_bound; also the source of a valid finite
+            big-M. Hitting the box signals a possibly unbounded region.
         time_limit : float
-            Gurobi time limit (seconds).  If exceeded, the returned point is the
-            incumbent and info['optimal'] is False (a bound, not the certified
-            optimum).
-        verbose : bool
-            If True, let Gurobi print its log.
+            Gurobi time limit in seconds, applied PER ROUND.
+        sparsity : bool
+            If True, minimise ||t||^2 + lam * ||t||_1 (elastic net), matching
+            the Ward solver's sparsity mode. Still a convex MIQP.
+        lam : float
+            L1 weight when sparsity=True.
+        allowed_features : array of bool, optional
+            Per-feature mask; disallowed coordinates are pinned to t_j = 0.
+        extra_blocks : list, optional
+            Additional witness-disjunction blocks from _cl_block, appended to
+            the base competitor blocks. This is the hook the complete-linkage
+            diversity descent uses to add sibling-preference constraints
+            (near = target child, far = its sibling) without touching this
+            method.
+        max_rounds : int
+            Cap on row-generation rounds.
+        rows_per_round : int
+            Cap on rows added per violated block per round, so one
+            pathological block cannot blow the model up in a single round.
 
         Returns
         -------
         A_prime : np.ndarray or None
-            Moved branch A + t* (shape n_A x d), or None if the model is proven
-            infeasible (the complete-linkage counterfactual region can be
-            genuinely empty).
+            A + t*, or None if proven infeasible / no incumbent found.
         info : dict
-            t, feasibility, optimality flag, distance moved, competitor count,
-            active (binding) witnesses, and the raw Gurobi status.
+            t, feasible, optimal, distance_moved, n_competitors,
+            binding_witnesses, gurobi_status, phase, rowgen rounds/rows,
+            rowgen_converged, revalidated, margin_unsquared.
         """
-
         if metric != 'euclidean':
             raise ValueError("This solver is Euclidean-only; use the Hamming MILP for binary data.")
         if anchor != 'min':
             raise NotImplementedError("Only anchor='min' (s* = min(s_A, s_B)) is implemented.")
 
-        
+        def _say(*a):
+            if verbose:
+                print(*a)
 
-        # ------------------------------------------------------------------
-        # Step 0 — resolve A and B as static wholes: node id, sorted leaves,
-        # and formation step s (row index in Z; -1 for a bare leaf).
-        # ------------------------------------------------------------------
+        # ---- Step 0: resolve A and B as static wholes ----
         A_node, A_leaves_sorted, s_A = self._resolve_branch(A_leaves)
         B_node, B_leaves_sorted, s_B = self._resolve_branch(B_leaves)
         if A_node == B_node:
@@ -1291,26 +1786,11 @@ class hiceCounterfactuals:
 
         A_pts = np.asarray(self.X[A_leaves_sorted], dtype=float)
         B_pts = np.asarray(self.X[B_leaves_sorted], dtype=float)
-        #n_A, n_B = len(A_pts), len(B_pts)
+        n_A, d = A_pts.shape
 
-        def _label(leaves):
-            return [index_to_name[i] for i in leaves] if index_to_name is not None else leaves
-
-        # ------------------------------------------------------------------
-        # Step 1 — anchor step and live partition L(s*).  s* = min(s_A, s_B) is
-        # the earliest moment structure in this region is committed; replaying
-        # rows 0..s* (cutoff = s*+1) yields the live blocks there.
-        # ------------------------------------------------------------------
+        # ---- Step 1/2: anchor step, live partition, competitor set ----
         s_star = min(s_A, s_B)
-        live_partition = self._alive_clusters_before_row( s_star + 1)
-
-        # ------------------------------------------------------------------
-        # Step 2 — competitor set: live blocks disjoint from BOTH A and B.
-        # L(s*) is a partition, so every block is wholly inside A, wholly inside
-        # B, or disjoint — the subset tests are unambiguous.  Blocks inside A are
-        # the mover; blocks inside B are dropped because B enters whole (its
-        # fragments must never compete against their own parent-as-target).
-        # ------------------------------------------------------------------
+        live_partition = self._alive_clusters_before_row(s_star + 1)
         A_set, B_set = set(A_leaves_sorted), set(B_leaves_sorted)
         competitor_nodes = {}
         for node_id, leaves in live_partition.items():
@@ -1319,156 +1799,248 @@ class hiceCounterfactuals:
                 continue
             competitor_nodes[node_id] = leaves
 
-        #print(f"Branch A                  : {_label(A_leaves_sorted)} (n_A={n_A}, step s_A={s_A})")
-        #print(f"Branch B (target)         : {_label(B_leaves_sorted)} (n_B={n_B}, step s_B={s_B})")
-        #print(f"Anchor step s*            : {s_star}")
-        #rint(f"Live competitors at s*    : {len(competitor_nodes)} clusters, "
-        #     f"sizes {[len(v) for v in competitor_nodes.values()]}")
+        # A's OWN UNMOVED POSITION is a competitor, exactly as in
+        # _build_ward_geometry and in the complete-linkage wrapper. It must be
+        # added HERE and not left to the wrapper: this method rebuilds the
+        # competitor set from the live partition itself, so a caller's copy of
+        # it is not consulted and the constraint would simply vanish.
+        #
+        # Without it the model permits a "counterfactual" that barely moves --
+        # it can edge out every real competitor while still being closer to
+        # where A already was, which metrics.validity (via its A_orig
+        # argument) correctly rejects. Observed on wine pair 1: the solver
+        # returned a certified-optimal t with ||t|| = 2.84, SMALLER than the
+        # competitor-ignoring MEB baseline's 5.32, and independent
+        # revalidation marked it invalid. The symptom is distinctive --
+        # solver_optimal=True together with valid=False and a suspiciously
+        # small displacement.
+        competitor_nodes["__A_unmoved__"] = A_leaves_sorted
 
-        def cl_max(P_pts, Q_pts):
-            return cdist(P_pts, Q_pts, metric='euclidean').max()
+        extra_blocks = list(extra_blocks or [])
 
-        # Guard 1 — no competitors: every t feasible, nothing to beat.
-        if not competitor_nodes:
-            print("No live competitors at s* — every t is feasible; returning t*=0.")
-            return A_pts.copy(), {"t": np.zeros(self.d), "feasible": True, "optimal": True,
-                                "distance_moved": 0.0, "n_competitors": 0,
-                                "already_optimal": True}
+        def _zero_info(extra):
+            info = {"t": np.zeros(d), "feasible": True, "optimal": True,
+                    "distance_moved": 0.0, "n_competitors": len(competitor_nodes),
+                    "already_optimal": True, "phase": "trivial",
+                    "rowgen_rounds": 0, "rowgen_rows": 0,
+                    "rowgen_converged": True, "binding_witnesses": []}
+            info.update(extra)
+            return info
 
-        # Guard 2 — A already strictly dominates B against every competitor at t=0.
-        dAB0 = cl_max(A_pts, B_pts)
-        if all(dAB0 < cl_max(A_pts, np.asarray(self.X[leaves], dtype=float)) - eps
-            for leaves in competitor_nodes.values()):
-            print("A already dominates B against every competitor at t=0; returning t*=0.")
-            return A_pts.copy(), {"t": np.zeros(self.d), "feasible": True, "optimal": True,
-                                "distance_moved": 0.0, "n_competitors": len(competitor_nodes),
-                                "already_optimal": True}
+        # Guard 1 -- nothing to beat. Only valid when there are no extra
+        # blocks either: a sibling-preference block still constrains t even
+        # when the competitor set is empty.
+        if not competitor_nodes and not extra_blocks:
+            _say("No live competitors at s* -- every t is feasible; returning t*=0.")
+            return A_pts.copy(), _zero_info({})
 
-        # ------------------------------------------------------------------
-        # Step 3 — difference sets.
-        #   P   = V_AB = {a - b}  : the A-B pairs; the chosen witness must beat
-        #                            ALL of these (rigid A => full product, not a
-        #                            per-point slice).
-        #   Q_X = V_AX = {a - c}  : per competitor, the candidate witnesses; each
-        #                            carries its originating competitor leaf so the
-        #                            binding witness can be reported by name.
-        # No hull reduction (kept exact); scales as n_A*n_B and n_A*|X|.
-        # ------------------------------------------------------------------
-        P = [a - b for a in A_pts for b in B_pts]
-        competitor_Q = {}
-        for nid, leaves in competitor_nodes.items():
-            C_pts = np.asarray(self.X[leaves], dtype=float)
-            competitor_Q[nid] = [(a - c, leaf) for a in A_pts for leaf, c in zip(leaves, C_pts)]
+        # Guard 2 -- A already dominates at t=0 (again only without extra blocks).
+        if not extra_blocks:
+            dAB0 = complete_linkage_max(A_pts, B_pts, metric)
+            if all(dAB0 < complete_linkage_max(A_pts, np.asarray(self.X[lv], dtype=float),
+                                                metric) - eps
+                   for lv in competitor_nodes.values()):
+                _say("A already dominates B against every competitor at t=0; returning t*=0.")
+                return A_pts.copy(), _zero_info({})
 
-        # ------------------------------------------------------------------
-        # Step 4 — the convex MIQP.
-        #   min ||t||^2
-        #   for each competitor X:  sum_q z_{X,q} >= 1 # for each competitor, at least one witness must dominate
-        # i.e. there need to be at least one point of X farther from A than any pair in A-B
-        #   for each competitor X, witness q, pair p:
-        #       2<p - q, t>  <=  ||q||^2 - ||p||^2 - eps + M_{X,q,p} (1 - z_{X,q})
-        # Convex quadratic objective, linear constraints, binary z -> convex MIQP,
-        # solved to certified global optimality by Gurobi's B&B.
-        # ------------------------------------------------------------------
+        # ---- Step 3: blocks ----
+        blocks = self._cl_pair_blocks(A_pts, B_pts, competitor_nodes) + extra_blocks
+        if not blocks:
+            return A_pts.copy(), _zero_info({})
+
+        # ---- Step 4: model ----
         model = gp.Model("cl_counterfactual_branch")
         model.Params.OutputFlag = 1 if verbose else 0
         model.Params.TimeLimit = time_limit
-        
+        # Indicator constraints remove the big-M leakage, but a tight
+        # integrality tolerance costs nothing and guards the z > 0.5 reads.
+        model.Params.IntFeasTol = 1e-9
 
-        t = model.addVars(self.d, lb=-t_bound, ub=t_bound, name="t")
-        model.setObjective(gp.quicksum(t[j] * t[j] for j in range(self.d)), GRB.MINIMIZE)
+        t = model.addVars(d, lb=-t_bound, ub=t_bound, name="t")
+        if allowed_features is not None:
+            mask = np.asarray(allowed_features, dtype=bool).ravel()
+            if mask.shape[0] != d:
+                raise ValueError(f"allowed_features must have length d={d}, got {mask.shape[0]}.")
+            if not mask.any():
+                raise ValueError("allowed_features must allow at least one feature to change.")
+            for j in range(d):
+                if not mask[j]:
+                    t[j].lb = 0.0
+                    t[j].ub = 0.0
 
-        z = {}  # (competitor_id, witness_row_index) -> binary var
-        binding_lookup = {}  # (competitor_id, witness_row_index) -> competitor leaf (for reporting)
+        obj = gp.quicksum(t[j] * t[j] for j in range(d))
+        if sparsity:
+            # |t_j| via u_j >= +-t_j; minimised, so u_j tightens to |t_j|.
+            u = model.addVars(d, lb=0.0, ub=t_bound, name="u")
+            for j in range(d):
+                model.addConstr(u[j] >= t[j], name=f"abs_pos_{j}")
+                model.addConstr(u[j] >= -t[j], name=f"abs_neg_{j}")
+            obj = obj + lam * gp.quicksum(u[j] for j in range(d))
+        model.setObjective(obj, GRB.MINIMIZE)
 
-        # In low dimesnions finding the hull helps a lot
-        # Many other possible speed-ups exist (pruning of witnesses and prioritizing likelihood of being the witness)
-        # Eventually test wether to implement them
-        for nid, q_list in competitor_Q.items():
-            # q_list = The list of candidate witnesses, i.e. a-c, a\inA and C\in X
-            # one binary per candidate witness of this competitor
-            for wi, (q, leaf) in enumerate(q_list):
-                # leaf: leaf index of the competitor point
-                z[(nid, wi)] = model.addVar(vtype=GRB.BINARY, name=f"z_{nid}_{wi}")
-                binding_lookup[(nid, wi)] = leaf
+        # one binary per (block, witness) + the existential per block
+        zs = []
+        for bi, blk in enumerate(blocks):
+            zb = model.addVars(len(blk["Q"]), vtype=GRB.BINARY, name=f"z_{bi}")
+            model.addConstr(gp.quicksum(zb[wi] for wi in range(len(blk["Q"]))) >= 1,
+                            name=f"pick_{bi}")
+            zs.append(zb)
 
-            # at least one witness selected for this competitor (the existential)
-            model.addConstr(gp.quicksum(z[(nid, wi)] for wi in range(len(q_list))) >= 1,
-                            name=f"pick_{nid}")
+        added = set()
 
-            # domination rows: chosen witness q must beat every p in P (= V_AB)
-            for wi, (q, _leaf) in enumerate(q_list):
-                qq = float(np.dot(q, q))
-                for p in P:
-                    # linear-in-t row: 2<p-q, t> <= ||q||^2 - ||p||^2 - eps  (when z=1)
-                    coeff = 2.0 * (p - q)                 # length-d vector
-                    rhs = qq - float(np.dot(p, p)) - eps
-                    # big-M so the row is vacuous when z=0.  On the box |t_j|<=t_bound,
-                    # the LHS 2<p-q,t> is at most 2*||p-q||_1 * t_bound in abs value;
-                    # M must cover (max LHS - rhs) so that z=0 can't bind the row.
-                    lhs_max = 2.0 * float(np.sum(np.abs(p - q))) * t_bound
-                    M = lhs_max - rhs + 1.0
-                    model.addConstr(
-                        gp.quicksum(coeff[j] * t[j] for j in range(self.d))
-                        <= rhs + M * (1 - z[(nid, wi)]),
-                        name=f"dom_{nid}_{wi}_{id(p) % 100000}")
+        def add_row(bi, wi, pi):
+            if (bi, wi, pi) in added:
+                return False
+            blk = blocks[bi]
+            p, q = blk["P"][pi], blk["Q"][wi]
+            rhs = float(blk["qq"][wi]) - float(blk["pp"][pi]) - eps
+            coeff = 2.0 * (p - q)
+            # INDICATOR, not big-M: "z = 1  =>  2<p-q,t> <= rhs".
+            #
+            # A big-M encoding (rhs + M(1-z), with M derived from the t-box)
+            # is numerically unsafe here. t_bound is large (1e4 by default)
+            # while the rows have scale ~1 on standardised data, so
+            # M ~ 2*||p-q||_1*t_bound reaches 1e5-1e6; Gurobi's integrality
+            # tolerance then lets z = 1 - 1e-5 pass as "selected", leaving
+            # M*1e-5 ~ 1-10 of slack on a unit-scale constraint. The solver
+            # returns a point that satisfies the model as written but
+            # violates true complete-linkage domination (observed: a -0.075
+            # unsquared margin, and an objective 8% BELOW the dense
+            # full-model optimum, i.e. a spuriously cheap "solution").
+            # Indicator constraints are enforced by branching rather than by
+            # a magic constant, so the leakage class disappears entirely and
+            # t_bound reverts to being only a sanity box on t.
+            model.addGenConstrIndicator(
+                zs[bi][wi], True,
+                gp.quicksum(coeff[j] * t[j] for j in range(d)) <= rhs,
+                name=f"dom_b{bi}_w{wi}_p{pi}")
+            added.add((bi, wi, pi))
+            return True
 
-        model.optimize()
+        # seed: for each (block, witness), the largest-norm p
+        for bi, blk in enumerate(blocks):
+            pi0 = int(np.argmax(blk["pp"]))
+            for wi in range(len(blk["Q"])):
+                add_row(bi, wi, pi0)
 
-        # ------------------------------------------------------------------
-        # Step 5 — read out, distinguishing "certified global optimum" from
-        # "incumbent at time limit".
-        # ------------------------------------------------------------------
-        status = model.Status
-        if status == GRB.INFEASIBLE:
-            print("\nFeasible                  : False")
-            print("No t satisfies the complete-linkage margin against every live "
-                "competitor — the region can be genuinely empty (a spread-out B "
-                "need not be dominatable).")
-            return None, {"feasible": False, "optimal": True,  # infeasibility is a certified result
-                        "n_competitors": len(competitor_nodes), "gurobi_status": status}
+        # ---- row generation ----
+        TOL = 1e-7
+        stalled_blocks = []
+        status = None
+        rounds = 0
+        converged = False
+        for rounds in range(1, max_rounds + 1):
+            model.optimize()
+            status = model.Status
+            if status == GRB.INFEASIBLE:
+                # a relaxation being infeasible proves the full model is too
+                _say("\nFeasible: False (relaxation infeasible => full model infeasible)")
+                return None, {"feasible": False, "optimal": True,
+                              "n_competitors": len(competitor_nodes),
+                              "gurobi_status": status, "phase": "miqp-rowgen",
+                              "rowgen_rounds": rounds, "rowgen_rows": len(added),
+                              "rowgen_converged": True}
+            if model.SolCount == 0:
+                _say("\nFeasible: unknown (no incumbent within time limit)")
+                return None, {"feasible": False, "optimal": False,
+                              "n_competitors": len(competitor_nodes),
+                              "gurobi_status": status, "phase": "miqp-rowgen",
+                              "rowgen_rounds": rounds, "rowgen_rows": len(added),
+                              "rowgen_converged": False}
 
-        if model.SolCount == 0:
-            # no incumbent found (e.g. time-limited before any feasible point)
-            print("\nFeasible                  : unknown (no incumbent found within time limit)")
-            return None, {"feasible": False, "optimal": False,
-                        "n_competitors": len(competitor_nodes), "gurobi_status": status}
+            t_val = np.array([t[j].X for j in range(d)])
+            any_added = False
+            stalled_blocks = []
+            for bi, blk in enumerate(blocks):
+                sel = [wi for wi in range(len(blk["Q"])) if zs[bi][wi].X > 0.5]
+                if not sel:
+                    continue
+                viol_by_w, satisfied = {}, False
+                for wi in sel:
+                    # rows for this witness: 2<p-q,t> - (qq_w - pp - eps) <= 0
+                    lhs = 2.0 * ((blk["P"] - blk["Q"][wi]) @ t_val)
+                    slack = (float(blk["qq"][wi]) - blk["pp"] - eps) - lhs
+                    bad = np.nonzero(slack < -TOL)[0]
+                    if bad.size == 0:
+                        satisfied = True
+                        break
+                    viol_by_w[wi] = bad
+                if satisfied:
+                    continue
+                # push the closest-to-valid selected witness
+                wi_best = min(viol_by_w, key=lambda w: viol_by_w[w].size)
+                worst = viol_by_w[wi_best]
+                # most-violated rows first
+                lhs = 2.0 * ((blk["P"] - blk["Q"][wi_best]) @ t_val)
+                slack = (float(blk["qq"][wi_best]) - blk["pp"] - eps) - lhs
+                for pi in worst[np.argsort(slack[worst])][:rows_per_round]:
+                    any_added = add_row(bi, wi_best, int(pi)) or any_added
+                stalled_blocks.append(blk["key"])
+            if not any_added:
+                # Distinguish "nothing left to violate" (true convergence)
+                # from "violated, but every offending row is ALREADY in the
+                # model" -- the latter means the solver returned a point that
+                # breaks a constraint it was given, i.e. a numerical failure
+                # rather than a modelling gap, and adding rows cannot fix it.
+                # Silently reporting convergence there is exactly how the
+                # big-M leakage above went undetected, so it is surfaced.
+                converged = not stalled_blocks
+                break
 
-        t_val = np.array([t[j].X for j in range(self.d)])
+        # ---- Step 5: read out ----
+        t_val = np.array([t[j].X for j in range(d)])
         A_prime = A_pts + t_val
         dist_moved = float(np.linalg.norm(t_val))
-        is_optimal = (status == GRB.OPTIMAL)
+        is_optimal = (status == GRB.OPTIMAL) and converged
 
-        # active witnesses: competitor leaves whose selection binary is 1
         binding = sorted({
-            (index_to_name[leaf] if index_to_name is not None else leaf)
-            for key, var in z.items() if var.X > 0.5
-            for leaf in [binding_lookup[key]]
+            (index_to_name[lab] if (index_to_name is not None
+                                     and lab in index_to_name) else lab)
+            for bi, blk in enumerate(blocks)
+            for wi in range(len(blk["Q"]))
+            if zs[bi][wi].X > 0.5
+            for lab in [blk["labels"][wi]]
         }, key=str)
 
-        if any(abs(abs(v) - t_bound) < 1e-6 for v in t_val):
-            print("NOTE: |t_j| hit t_bound — the feasible region may be unbounded; "
-                "consider raising t_bound.")
+        if np.any(np.abs(np.abs(t_val) - t_bound) < 1e-6):
+            _say("NOTE: |t_j| hit t_bound -- region may be unbounded; raise t_bound.")
 
-        print(f"\nFeasible                  : True")
-        print(f"Globally optimal          : {is_optimal}  (Gurobi status {status})")
-        print(f"||t*||                    : {dist_moved:.6f}")
-        print(f"Active (binding) witnesses: {binding}")
+        # Independent re-check on UNSQUARED distances, the same criterion
+        # metrics.validity uses, since this solver's eps is a squared margin.
+        comp_pts = [np.asarray(self.X[lv], dtype=float) for lv in competitor_nodes.values()]
+        if comp_pts:
+            revalid, margin_unsq = _dominates(A_prime, B_pts, comp_pts, 'complete',
+                                               0.0, return_margin=True)
+        else:
+            revalid, margin_unsq = True, float('inf')
+
+        _say(f"\nFeasible: True | globally optimal: {is_optimal} "
+             f"(status {status}, {rounds} rowgen rounds, {len(added)} rows)")
+        _say(f"||t*||: {dist_moved:.6f} | binding witnesses: {binding}")
 
         info = {
             "t": t_val,
             "feasible": True,
-            "optimal": is_optimal,               # True only if status == OPTIMAL
+            "optimal": is_optimal,
             "distance_moved": dist_moved,
             "n_competitors": len(competitor_nodes),
             "binding_witnesses": binding,
             "gurobi_status": status,
+            "phase": "miqp-rowgen",
+            "rowgen_rounds": rounds,
+            "rowgen_rows": len(added),
+            "rowgen_converged": converged,
+            "rowgen_stalled_blocks": len(stalled_blocks) if not converged else 0,
+            "revalidated": bool(revalid),
+            "margin_unsquared": float(margin_unsq),
+            "sparsity": bool(sparsity),
+            "lam": float(lam) if sparsity else 0.0,
         }
         return A_prime, info
-'''
 
 
-    def _solve_branch_hamming(self, A_pts, B_pts, competitor_nodes, eps, big_m, index_to_name):
+    def _solve_branch_hamming(self, A_pts, B_pts, competitor_nodes, eps, big_m,
+                               index_to_name, time_limit=None, extra_blocks=None):
         """
         Complete-linkage Hamming counterfactual under the RIGID RELABELING move
         (binary OR categorical), consistent with the convention or rigid translation.
@@ -1534,7 +2106,10 @@ class hiceCounterfactuals:
         Acols = [A_pts[:, j].tolist() for j in range(d)]
         Bcols = [B_pts[:, j].tolist() for j in range(d)]
         src_vals = [sorted(set(Acols[j])) for j in range(d)]                 # sources: A's values
-        tgt_vals = [sorted(set(Acols[j]) | set(Bcols[j])) for j in range(d)]  # targets: A ∪ B values
+        _extra_near = [np.asarray(nb) for _k, nb, _f in (extra_blocks or [])]
+        tgt_vals = [sorted(set(Acols[j]) | set(Bcols[j])
+                           | {int(v) for nb in _extra_near for v in nb[:, j]})
+                    for j in range(d)]  # targets: A u B u any block's near values
     
         # ---- variable layout: y[j,alpha,beta], then moved_j, then z[nid,a_i,c_leaf] ----
         y_col, col = {}, 0 #look-up dictionary that tells us where the variable y[j, a, b] lives
@@ -1552,32 +2127,85 @@ class hiceCounterfactuals:
         # and the big-M domination rows enforce that the selected witness actually 
         # beats every A–B pair.
         competitor_ids = list(competitor_nodes.keys())
+        _all_blocks = [(nid, list(competitor_nodes[nid])) for nid in competitor_ids]
+        _all_blocks += [(key, list(far)) for key, _near, far in (extra_blocks or [])]
         z_col = {}
-        for nid in competitor_ids:
+        for nid, far_leaves in _all_blocks:
             for a_i in range(n_A):
-                for c_leaf in competitor_nodes[nid]:
+                for c_leaf in far_leaves:
                     z_col[(nid, a_i, c_leaf)] = col
                     col += 1
         n_vars = col
+
+        # Each BLOCK is one domination requirement with its own NEAR set --
+        # the pairs a witness must out-distance -- and its own FAR leaves,
+        # from which witnesses are drawn:
+        #
+        #   base block      near = B,            far = a competitor
+        #   sibling block   near = target child, far = that child's sibling
+        #
+        # The original code hardcoded near = B for every block, which is why a
+        # sibling-preference constraint could not be expressed: its near set is
+        # V_{A, child}, not V_{A, B}. extra_blocks is a list of
+        # (key, near_pts, far_leaves); omitting it reproduces the previous
+        # behaviour exactly.
+        blocks = {}
+        for nid in competitor_ids:
+            blocks[nid] = (np.asarray(B_pts), list(competitor_nodes[nid]))
+        for key, near_pts, far_leaves in (extra_blocks or []):
+            blocks[key] = (np.asarray(near_pts), list(far_leaves))
+        block_ids = list(blocks.keys())
+
+        comp_witnesses = {k: [(a_i, lf) for a_i in range(n_A) for lf in blocks[k][1]]
+                          for k in block_ids}
+        comp_cvals = {k: {lf: np.asarray(self.X[lf]).tolist() for lf in blocks[k][1]}
+                      for k in block_ids}
+        block_near = {k: blocks[k][0] for k in block_ids}
+        block_nearcols = {k: [block_near[k][:, j].tolist() for j in range(d)]
+                          for k in block_ids}
     
-        # big-M: domination LHS in [-d, d]; deactivation needs eps - M <= -d.
-        M = big_m if big_m is not None else d + abs(eps) + 1.0
-    
+        # big-M: the domination LHS lies in [-d, d], so deactivation at z = 0
+        # needs eps - M <= -d, i.e. M >= d + eps. Note how SMALL this is --
+        # tens, against integer-valued rows -- compared with the 1e5-1e6 the
+        # Euclidean solver's t-box produced, where Gurobi's integrality
+        # tolerance leaked M*1e-5 of slack and silently returned INVALID
+        # solutions. At this scale the same leakage is ~1e-5 against rows that
+        # move in unit steps, so it cannot flip a feasible row.
+        # Hamming distances are INTEGERS, so "strictly greater" means a gap of
+        # at least 1 and a margin of 0.5 is exactly equivalent to the caller's
+        # tiny eps -- while being vastly safer numerically. With M ~ d and
+        # HiGHS's integrality tolerance ~1e-5, a big-M row leaks ~2e-4 of
+        # slack, which is enough to let a TIE (gap 0) pass a row demanding
+        # gap >= 1e-6. That is the same leakage class that silently produced
+        # invalid Euclidean solutions; here it made row generation stall on a
+        # row already in the model and (before this) mis-report the pair as
+        # infeasible. 0.5 sits ~2500x above the leakage, so ties cannot pass.
+        eps_int = max(float(eps), 0.5)
+        M = big_m if big_m is not None else d + eps_int + 1.0
+
         c_obj = np.zeros(n_vars)
         #c_obj is the vector of coefficients that we will give in input to scipy's milp
         for j in range(d):
             c_obj[moved_col[j]] = 1.0  # minimize number of coordinates relabeled, i.e. small move and sparisty coincide
             # every variable has a weight of 1
     
-        A_rows, lb, ub = [], [], []
+        # Sparse (row, col, val) triplets instead of dense rows: each row
+        # touches ~d+2 of n_vars columns, so a dense matrix wasted virtually
+        # all its memory and was the binding limit on dataset size.
+        rr, cc, vv, lb, ub = [], [], [], [], []
+        _nrow = [0]
+
+        def _row(entries, lo, hi):
+            r = _nrow[0]
+            for cidx, val in entries:
+                rr.append(r); cc.append(cidx); vv.append(val)
+            lb.append(lo); ub.append(hi)
+            _nrow[0] += 1
     
         # (1) totality: each (j, alpha) maps to exactly one beta
         for j in range(d):
             for a in src_vals[j]:
-                row = np.zeros(n_vars)
-                for b in tgt_vals[j]:
-                    row[y_col[(j, a, b)]] = 1.0 # we put at 1 every coefficient
-                A_rows.append(row); lb.append(1.0); ub.append(1.0)
+                _row([(y_col[(j, a, b)], 1.0) for b in tgt_vals[j]], 1.0, 1.0)
                 # so basically we have sum_j y[j, a, b] = 1 which means that each value of alpha 
                 # is remapped to exactly one beta (which could be alpha itself)
     
@@ -1592,53 +2220,202 @@ class hiceCounterfactuals:
         # vecomes moved_j >=1, which enforces moved_j signal that j was relabelled
         for j in range(d):
             for a in src_vals[j]:
-                row = np.zeros(n_vars)
-                row[moved_col[j]] = 1.0 #coefficient of the constraint
-                row[y_col[(j, a, a)]] = 1.0 # coefficient of the constraint
-                A_rows.append(row) # Add to the constrain matrix
-                lb.append(1.0)
-                ub.append(np.inf)
+                _row([(moved_col[j], 1.0), (y_col[(j, a, a)], 1.0)],
+                     1.0, np.inf)
     
         # (3) at least one witness selected per competitor
-        for nid in competitor_ids:
-            row = np.zeros(n_vars)
-            for a_i in range(n_A):
-                for c_leaf in competitor_nodes[nid]:
-                    row[z_col[(nid, a_i, c_leaf)]] = 1.0
-            A_rows.append(row); lb.append(1.0); ub.append(np.inf)
+        for nid in block_ids:
+            _row([(z_col[(nid, a_i, c_leaf)], 1.0)
+                  for a_i, c_leaf in comp_witnesses[nid]],
+                 1.0, np.inf)
             # number of witnesses selected >= 1
     
-        # (4) domination: witness (a_i, c) beats every A-B pair (a', b):
+        # (4) domination, generated LAZILY.
+        #
+        # The exact row set is one per (witness, A-B pair) triple:
         #     sum_j y[j,a'_j,b_j] - sum_j y[j,a_i_j,c_j] - M*z >= eps - M
-        # if c is the withness z=1, the difference between the two sums is > eps i.e. 
-        # d - d(a',b) > d - d(a, c), d(a, c) > d(a', b). Remember the definition d(a, b) = d - sum_j y[j, a_j, b_j]
+        # which at z = 1 reads d_H(f(a_i), c) >= d_H(f(a'), b) + eps: the
+        # selected witness out-distances that pair. Those rows number
+        # (n_A * sum_X |X|) * (n_A * n_B) -- MULTIPLICATIVE, with n_A squared
+        # since it sizes both factors. For a 1728-row dataset at
+        # n_A = n_B = 15 that is ~5.8M rows which, as the dense matrix this
+        # used to build, is ~8 GB for ONE pair: not slow but impossible, and
+        # it capped this solver to tiny datasets.
+        #
+        # So rows are generated on demand, exactly as the Euclidean MIQP
+        # does: seed one row per witness, solve, add only the rows the
+        # incumbent actually violates, repeat. The generated model is a
+        # RELAXATION of the full one (a subset of its rows), so its optimum
+        # bounds the full optimum from below; terminating with nothing
+        # violated means the incumbent is feasible for the full model and
+        # therefore optimal for it. The seeded model has n_A * sum_X |X| rows
+        # -- the same additive order a single-epigraph reformulation would
+        # give, but without altering semantics that are already verified
+        # against brute-force enumeration.
+        #
+        # (An epigraph on d(A,B) was tried and abandoned. It should be
+        # equivalent and provably no looser, yet it accepted tie solutions
+        # that brute force proves are not strictly dominating, on competitors
+        # whose rows were somehow not binding. Not reintroduced until that is
+        # understood.)
 
 
-        # To speed it up we need to implement lazy constraint generation, consider also that
-        # in low dimensions we improve a lot with hull reduction
-        for nid in competitor_ids:
-            for a_i in range(n_A):
-                for c_leaf in competitor_nodes[nid]:
-                    c = np.asarray(self.X[c_leaf]).tolist()
-                    zc = z_col[(nid, a_i, c_leaf)]
-                    for ap_i in range(n_A):
-                        for b_i in range(n_B):
-                            row = np.zeros(n_vars)
-                            for j in range(d):
-                                key_b = (j, Acols[j][ap_i], Bcols[j][b_i])
-                                if key_b in y_col:
-                                    row[y_col[key_b]] += 1.0
-                                key_c = (j, Acols[j][a_i], c[j])
-                                if key_c in y_col:          # absent -> competitor-only value, no match
-                                    row[y_col[key_c]] -= 1.0
-                            row[zc] += -M
-                            A_rows.append(row); lb.append(eps - M); ub.append(np.inf)
-    
-        constraints = LinearConstraint(np.array(A_rows), np.array(lb), np.array(ub))
-        bounds = Bounds(lb=np.zeros(n_vars), ub=np.ones(n_vars))
-        integrality = np.ones(n_vars)  # all binary (y, moved_j, z)
-    
-        res = milp(c_obj, constraints=constraints, bounds=bounds, integrality=integrality)
+        base_rr, base_cc, base_vv = list(rr), list(cc), list(vv)
+        base_lb, base_ub, base_n = list(lb), list(ub), _nrow[0]
+        added = set()
+        gen = {'rr': [], 'cc': [], 'vv': [], 'lb': [], 'ub': []}
+
+        def add_dom(nid, a_i, c_leaf, ap_i, b_i):
+            key = (nid, a_i, c_leaf, ap_i, b_i)
+            if key in added:
+                return False
+            c = comp_cvals[nid][c_leaf]
+            nearcols = block_nearcols[nid]
+            ent = {}
+            for j in range(d):
+                key_b = (j, Acols[j][ap_i], nearcols[j][b_i])
+                if key_b in y_col:
+                    ent[y_col[key_b]] = ent.get(y_col[key_b], 0.0) + 1.0
+                key_c = (j, Acols[j][a_i], c[j])
+                if key_c in y_col:   # absent -> competitor-only value, never matches
+                    ent[y_col[key_c]] = ent.get(y_col[key_c], 0.0) - 1.0
+            zc = z_col[(nid, a_i, c_leaf)]
+            ent[zc] = ent.get(zc, 0.0) - M
+            r = base_n + len(gen['lb'])
+            for cidx, val in ent.items():
+                gen['rr'].append(r); gen['cc'].append(cidx); gen['vv'].append(val)
+            gen['lb'].append(eps_int - M); gen['ub'].append(np.inf)
+            added.add(key)
+            return True
+
+        t_start = _time.monotonic()
+
+        def _remaining():
+            """Seconds of budget left, or None if unbounded."""
+            if time_limit is None:
+                return None
+            return max(1.0, time_limit - (_time.monotonic() - t_start))
+
+        def _solve_current():
+            nrows = base_n + len(gen['lb'])
+            A_sp = coo_matrix((base_vv + gen['vv'],
+                               (base_rr + gen['rr'], base_cc + gen['cc'])),
+                              shape=(nrows, n_vars)).tocsr()
+            cons = LinearConstraint(A_sp, np.array(base_lb + gen['lb']),
+                                    np.array(base_ub + gen['ub']))
+            bnds = Bounds(lb=np.zeros(n_vars), ub=np.ones(n_vars))
+            # The budget MUST be handed to HiGHS, not merely wrapped around
+            # this call. utilityFunctions.time_limit raises from a SIGALRM
+            # handler, and Python can only run a signal handler between
+            # bytecodes -- but milp() is a C extension that holds the GIL for
+            # the whole solve, so the alarm is queued and the handler does not
+            # run until the solve returns on its own. A single call can
+            # therefore ignore the caller's timeout indefinitely: observed on
+            # splice (3005 x 60), where one pair ran for TWO DAYS at 100% CPU
+            # under a nominal 1200s limit. time_limit's own docstring assumed
+            # the slow methods were pure Python/numpy, true before this MILP
+            # path was exercised.
+            opts = {}
+            rem = _remaining()
+            if rem is not None:
+                opts["time_limit"] = rem
+            return milp(c_obj, constraints=cons, bounds=bnds,
+                        integrality=np.ones(n_vars), options=opts)
+
+        def _relabel_of(x):
+            rel = {j: {} for j in range(d)}
+            for j in range(d):
+                for a in src_vals[j]:
+                    for b in tgt_vals[j]:
+                        if x[y_col[(j, a, b)]] > 0.5:
+                            rel[j][a] = b
+                            break
+                    rel[j].setdefault(a, a)
+            out = A_pts.copy()
+            for j in range(d):
+                out[:, j] = [rel[j].get(int(v), int(v)) for v in A_pts[:, j].tolist()]
+            return out
+
+        # seed one row per witness, at the pair farthest apart under the
+        # IDENTITY relabeling -- the likeliest binding pair before any solve
+        for nid in block_ids:
+            nb = block_near[nid]
+            d0 = np.array([[int(np.count_nonzero(A_pts[ap] != nb[bi]))
+                            for bi in range(len(nb))] for ap in range(n_A)])
+            ap0, b0 = np.unravel_index(int(np.argmax(d0)), d0.shape)
+            for (a_i, c_leaf) in comp_witnesses[nid]:
+                add_dom(nid, a_i, c_leaf, int(ap0), int(b0))
+
+        max_rounds, rows_per_round = 64, 64
+        converged, rounds, res = False, 0, None
+        for rounds in range(1, max_rounds + 1):
+            if time_limit is not None and _time.monotonic() - t_start >= time_limit:
+                return None, {"feasible": False, "rowgen_rounds": rounds,
+                              "rowgen_rows": len(added), "rowgen_converged": False,
+                              "rowgen_timeout": True}
+            res = _solve_current()
+            if not res.success or res.x is None:
+                # HiGHS reports both genuine infeasibility and "hit the time
+                # limit with no incumbent" as a failed solve. Only the former
+                # proves the full model infeasible, so when the budget is
+                # exhausted this is reported as a timeout rather than as a
+                # proof that no counterfactual exists.
+                timed_out = (time_limit is not None
+                             and _time.monotonic() - t_start >= time_limit)
+                return None, {"feasible": False, "rowgen_rounds": rounds,
+                              "rowgen_rows": len(added),
+                              "rowgen_converged": not timed_out,
+                              "rowgen_timeout": timed_out}
+            x = res.x
+            A_rel = _relabel_of(x)
+            dAB_by_block = {}
+            for k in block_ids:
+                nb = block_near[k]
+                dAB_by_block[k] = np.array(
+                    [[int(np.count_nonzero(A_rel[ap] != nb[bi]))
+                      for bi in range(len(nb))] for ap in range(n_A)])
+            any_added, stalled = False, 0
+            for nid in block_ids:
+                dAB = dAB_by_block[nid]
+                sel = [w for w in comp_witnesses[nid]
+                       if x[z_col[(nid, w[0], w[1])]] > 0.5]
+                if not sel:
+                    continue
+                satisfied, viol = False, {}
+                for (a_i, c_leaf) in sel:
+                    dw = int(np.count_nonzero(A_rel[a_i] != np.asarray(self.X[c_leaf])))
+                    bad = np.argwhere(dAB + eps_int > dw)
+                    if len(bad) == 0:
+                        satisfied = True
+                        break
+                    viol[(a_i, c_leaf)] = bad
+                if satisfied:
+                    continue
+                w_best = min(viol, key=lambda k: len(viol[k]))
+                for (ap_i, b_i) in viol[w_best][:rows_per_round]:
+                    if add_dom(nid, w_best[0], w_best[1], int(ap_i), int(b_i)):
+                        any_added = True
+                    else:
+                        stalled += 1
+            if not any_added:
+                # Distinguish true convergence from "violated but every
+                # offending row is already present", which would mean the
+                # solver broke a row it was given rather than a row being
+                # missing -- adding more cannot fix that, so do not call it
+                # converged (the Euclidean solver learned this the hard way).
+                converged = (stalled == 0)
+                break
+
+        # A stall (violated, but every offending row already present) means
+        # the solver broke a row it was given -- a numerical failure, not a
+        # proof of emptiness. Reporting it as infeasible was wrong: it made
+        # this solver claim infeasible on a lymph pair the full dense model
+        # solves with 2 coordinates changed. Fall through and return the
+        # incumbent with rowgen_converged=False / optimal=False instead, so
+        # the caller's independent validity check adjudicates rather than a
+        # false "no counterfactual exists".
+        stalled_out = not converged
+
         if not res.success:
             # genuinely possible for complete linkage (a spread-out B may be undominatable)
             return None, {"feasible": False}
@@ -1675,6 +2452,14 @@ class hiceCounterfactuals:
             "coords_changed": coords_changed,  # == bits flipped for binary data
             "distance_moved": coords_changed,
             "binding_witnesses": binding,
+            "phase": "milp-rowgen",
+            "rowgen_rounds": rounds,
+            "rowgen_rows": len(added),
+            "rowgen_converged": not stalled_out,
+            # optimal only on true convergence: no violated row left means the
+            # relaxation optimum is full-model feasible, hence full-model
+            # optimal. A stall carries no such guarantee.
+            "optimal": not stalled_out,
         }
         return A_prime, info
 

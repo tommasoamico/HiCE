@@ -55,6 +55,38 @@ def detect_column_types(df, max_cardinality_ratio=0.05, max_unique_categorical=2
 # In small dimesnion it would be more convenient computing the convex hull
 # In high dimesnion, can use random projections acceoting a (1+epsilon) error or prune
 # now we leave it like this, candidate for optimisation
+def complete_linkage_meb_seed(A_pts, B_pts):
+    """
+    Min-max (MEB) translation seed for complete linkage: the t that minimises
+    A's FARTHEST distance to B, which is the natural complete-linkage analogue
+    of Ward's mu_B - mu_A seed.
+
+        t* = argmin_t max_{a in A, b in B} ||a + t - b||
+           = -center( minimum enclosing ball of V_AB = {a - b} )
+
+    (max_{a,b} ||a - b + t|| is the radius of the ball centred at -t that
+    encloses V_AB, so minimising it means centring that ball on the MEB.)
+
+    IMPORTANT -- unlike Ward's seed, this is NOT guaranteed to be a valid
+    counterfactual. Under Ward, moving A's centroid onto mu_B always dominates
+    every competitor, so mu_B - mu_A is always feasible. Under complete linkage
+    no such translation exists in general: this t minimises d(A(t), B) while
+    ignoring competitors entirely, so d(A(t), B) is the feasibility FLOOR but a
+    competitor may still be closer. It is therefore the best available starting
+    point -- if even this t cannot dominate, A's own min-max position loses --
+    but callers must treat it as a candidate, not a certificate, and cope with
+    a search frame that comes back single-class. See
+    hiceCounterfactuals.baselineCompleteLinkage, which uses the same
+    construction as a standalone baseline.
+    """
+    import miniball
+    A_pts = np.asarray(A_pts, dtype=float)
+    B_pts = np.asarray(B_pts, dtype=float)
+    V = np.array([a - b for a in A_pts for b in B_pts], dtype=float)
+    C, _r2 = miniball.get_bounding_ball(V)
+    return -np.asarray(C, dtype=float)
+
+
 def complete_linkage_max(P_pts, Q_pts, metric_):
         return cdist(P_pts, Q_pts, metric=metric_).max() 
 
@@ -540,6 +572,62 @@ def resolve_metric_and_validate(df, linkage):
         "requires a single ground metric (all-continuous -> Euclidean, or "
         "all-categorical -> Hamming). Mixed data would need a heterogeneous "
         f"metric such as Gower's, not implemented. Per-column types: {types}")
+
+
+OPENML_CACHE_DIR = "data/openml_cache"
+
+
+def load_openml_cached(name, linkage, attempts=8, base_delay=20.0, max_delay=300.0):
+    """
+    load_openml, memoised to disk as .npz, with bounded retries on the fetch.
+
+    Two things make the bare network call unsafe for a multi-day run:
+
+    1. OpenML is a live service that goes down. A 503 killed the Euclidean
+       run and a ConnectTimeout killed the Hamming run on 2026-10-21, each
+       costing most of a day of idle machine; neither was an experiment bug.
+    2. Access can disappear for reasons outside the service entirely. On
+       2026-10-22 openml.org began returning an IPS block page (HTTP 500,
+       "Web Page Blocked", Attack ID 20000053) to every host on the AU
+       network -- the site was fine, the route was not.
+
+    Since the data is immutable within a run, each (name, linkage) is fetched
+    once and stored; later launches, including resumes after a crash, read
+    from disk and never touch the network. That also PINS the version: a bare
+    name resolves to whatever OpenML currently calls the default, so an
+    uncached re-fetch could silently change the data under a pair_idx mapping
+    that assumes otherwise.
+
+    The practical upshot when the network is unavailable: populate the cache
+    anywhere that can reach OpenML and copy data/openml_cache/ across. The
+    .npz files are portable and self-contained.
+    """
+    import time as _time
+    os.makedirs(OPENML_CACHE_DIR, exist_ok=True)
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+    path = os.path.join(OPENML_CACHE_DIR, f"{safe}__{linkage}.npz")
+    if os.path.exists(path):
+        with np.load(path, allow_pickle=True) as z:
+            return z["X"], str(z["metric"]), None
+
+    last = None
+    for k in range(attempts):
+        try:
+            X, metric, types = load_openml(name, linkage)
+            np.savez_compressed(path, X=X, metric=metric)
+            print(f"[cache] stored '{name}' ({linkage}) -> {path}", flush=True)
+            return X, metric, types
+        except ValueError:
+            raise                       # unsupported data: a real, permanent skip
+        except Exception as e:
+            last = e
+            if k < attempts - 1:
+                delay = min(base_delay * (2 ** k), max_delay)
+                print(f"[retry] '{name}': {type(e).__name__}: {str(e)[:90]} "
+                      f"-- retrying in {delay:.0f}s ({k + 1}/{attempts - 1})",
+                      flush=True)
+                _time.sleep(delay)
+    raise last
 
 
 def load_openml(name, linkage):

@@ -48,6 +48,7 @@ Usage
 
 import argparse
 import csv
+import multiprocessing as mp
 import os
 import time
 
@@ -63,7 +64,7 @@ from modules.constants import (
 from modules.hiceCounterfactuals import hiceCounterfactuals
 from modules.utilityFunctions import (
     MethodTimeout, _prepare_out_csv, time_limit,
-    call_seed, _seed_everything, load_openml,
+    call_seed, _seed_everything, load_openml_cached,
 )
 from modules.metrics import (
     validity, proximity, tree_coverage, tree_coverage_from_targets, is_degenerate_tie,
@@ -83,7 +84,20 @@ LINKAGE = 'ward'   # the only linkage diverseCounterfactuals / DiCE / BayCon sup
 # real domination violation. Passed as a NEGATIVE eps (validity checks
 # dB < dX - eps, so a negative eps relaxes the margin to dB < dX + tol),
 # absorbing that noise without weakening the actual validity definition.
-REVALIDATION_TOL = 1e-9
+REVALIDATION_TOL = 1e-6
+# Raised from 1e-9 on 2026-11-01. HiCE minimises proximity, so its solution
+# lands exactly on the strict domination boundary; the feasible set is open,
+# the infimum is attained only in the limit, and a 1e-9 revalidation rejected
+# the returned point as invalid. Measured margins on every affected pair of
+# the Ward run: worst -1.4e-07, median -3.5e-09 absolute (worst relative
+# -3.0e-08) -- Clarabel's interior-point convergence residue. 1e-6 sits
+# comfortably above that noise floor and far below any real violation
+# (metrics.DEGENERATE_TIE_TOL is 1e-3).
+#
+# EUCLIDEAN ONLY. Hamming distances are integers with no rounding noise, and
+# any positive tolerance there turns strict domination into non-strict -- it
+# would count exact ties as valid and overstate validity on categorical data.
+# _reval_eps() pins Hamming to EXACTLY 0.0 and must keep doing so.
 
 
 # ======================================================================
@@ -102,30 +116,47 @@ def _hice_multi(cf, B_lv, A_lv, k):
     reliably force the split. Every returned CF stays validated against the
     original (A, B) pair's competitors.
 
-    Branch (>=2-leaf) targets are prioritized over leaf targets in the
-    selection (breadth-first within each group: shallowest depth, then
-    node id): a leaf target can never itself count as a represented
-    sub-branch (metrics.tree_coverage_from_targets), so spending a k-slot
-    on one ahead of an available branch target only wastes budget. Unlike
-    an earlier version of this selection, a node whose own dedicated CF
-    happens to be numerically identical to an ancestor's ("inherited-
-    parent", i.e. the ancestor's ALREADY dominates that specific sibling)
-    is NOT skipped: coverage is now judged by target_node identity, not by
-    geometric position, so that node's own labeled result is exactly what
-    earns it coverage credit -- discarding it as a "duplicate" would only
-    remove the one entry that can ever represent it.
+    include_leaf_targets=False: a leaf target can never itself count as a
+    represented sub-branch (metrics.tree_coverage_from_targets), so this
+    experiment only cares about branch (>=2-leaf) targets -- asking
+    diverseCounterfactuals to skip leaves entirely both saves the wasted
+    solver calls on nodes whose result could never be used for coverage,
+    and means every one of the k returned CFs is coverage-eligible (no
+    budget slot can fall through to a leaf once branch targets run out;
+    if fewer than k branch targets exist/are feasible, fewer than k are
+    simply returned instead).
     """
+    # sparsity=False, exhaustive=True: solve the objective the paper states
+    # (the plain squared norm) and certify optimality.
+    #
+    # sparsity=True adds an L1 term, making the objective an elastic net
+    # ||t||^2 + lam*||t||_1. That is still convex, so phase 1 stays exact --
+    # but it invalidates both exact routes in the sphere-repair step: the
+    # closed-form radial foot is L2-only, and the S-lemma SDP is not tight
+    # with an L1 term. Repair then falls back to multistart SLSQP, so phases
+    # 3 and 4 become heuristic and _solve_ward_core reports optimal=False
+    # (`opt = exhaustive and not use_sparsity`). Under sparsity the exhaustive
+    # flag therefore cannot buy optimality at all.
+    #
+    # exhaustive=True makes phase 4 enumerate every active-set size rather
+    # than stopping at the first that yields a feasible point, which is what
+    # makes the returned displacement certifiably minimal. It is the
+    # expensive setting: phase 4 is the combinatorial stage, so expect more
+    # timeouts than the early-stop default.
+    # USE_SPARSITY is set once from --sparsity. Everything else is held
+    # fixed (exhaustive=True, include_leaf_targets=False) so a run with the
+    # flag on differs from wardExactL2 in EXACTLY this one setting and the
+    # two are directly comparable curve-for-curve.
     results = cf.diverseCounterfactuals(B_leaves=B_lv, A_leaves=A_lv,
-                                         both_children=True, sparsity=True)
+                                         both_children=True,
+                                         sparsity=USE_SPARSITY,
+                                         exhaustive=USE_EXHAUSTIVE,
+                                         include_leaf_targets=False)
     feasible = [r for r in results if r['info'].get('feasible', False)]
 
-    candidates = list(feasible)
-    # Branch (>=2-leaf) targets first, breadth-first among themselves
-    # (shallowest depth, then node id); leaf targets last, in the same
-    # order -- a leaf target can never itself count as a represented
-    # sub-branch, so spending a k-slot on one ahead of an available branch
-    # target only wastes budget that could have gone toward real coverage.
-    candidates.sort(key=lambda r: (r['target_node'] < cf.n, r['depth'], r['target_node']))
+    # Breadth-first: shallowest depth first, then node id as a tiebreak, so
+    # the k kept span as much of B's subtree as the budget allows.
+    candidates = sorted(feasible, key=lambda r: (r['depth'], r['target_node']))
     chosen = candidates[:k]
     # Stash target_node onto info so _cf_list_stats can compute exact
     # (non-geometric) tree coverage for HiCE -- see
@@ -137,6 +168,55 @@ def _hice_multi(cf, B_lv, A_lv, k):
         info['target_node'] = r['target_node']
         out.append((r['A_prime'], info))
     return out, len(results)
+
+
+class HardTimeout(Exception):
+    pass
+
+
+def _hard_worker(q, fn):
+    try:
+        q.put(("ok", fn()))
+    except Exception as e:                      # reported to the parent, not raised
+        q.put(("err", "%s: %s" % (type(e).__name__, e)))
+
+
+def hard_limit(fn, seconds):
+    """
+    Run fn() under a HARD wall-clock wall, in a forked child that is killed if
+    it overruns.
+
+    utilityFunctions.time_limit cannot bound HiCE. Its own docstring states the
+    assumption: SIGALRM is "fine here since the slow offenders (DiCE genetic
+    search, BayCon) are pure Python/numpy and periodically release control".
+    That holds for those two, but HiCE's slow path sits inside Clarabel/SciPy C
+    extensions that hold the GIL, so the handler cannot run until the call
+    returns on its own and the budget is unenforceable on exactly the pairs
+    that need it. Observed consequences: wardExactL2 recorded a HiCE max of
+    5212s against a 1200s cap, and a single mfeat-zernike pair ran 5h37m.
+
+    fork is required: fn is a closure over cf/B_lv/A_lv and is never pickled,
+    so the child inherits them from memory. Only the RESULT crosses the Queue,
+    which for _hice_multi is a list of (ndarray, dict) plus an int.
+    """
+    if seconds is None:
+        return fn()
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+    proc = ctx.Process(target=_hard_worker, args=(q, fn), daemon=True)
+    proc.start()
+    proc.join(seconds)
+    if proc.is_alive():
+        proc.terminate(); proc.join(5)
+        if proc.is_alive():
+            proc.kill(); proc.join(5)
+        raise HardTimeout("exceeded %.0fs wall-clock limit" % seconds)
+    if q.empty():
+        raise RuntimeError("solver child died without returning")
+    tag, val = q.get()
+    if tag == "err":
+        raise RuntimeError(val)
+    return val
 
 
 def _cf_list_stats(cf_results, A_pts, B_pts, comp_pts, metric, Z, n_leaves, B_node, X):
@@ -237,10 +317,21 @@ def _cf_list_stats(cf_results, A_pts, B_pts, comp_pts, metric, Z, n_leaves, B_no
 # Main loop
 # ======================================================================
 def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
-        seed=0, eps=0.0, timeout=300):
+        seed=0, eps=0.0, timeout=300, dice_timeout=None):
     dataset_label = dataset
+    # DiCE gets its own, usually shorter, wall-clock budget: its genetic
+    # search cannot self-terminate, and on this experiment's pairs it hits
+    # the limit on ~55% of calls, every one of them returning ZERO valid
+    # counterfactuals after burning the full budget -- i.e. that time is
+    # pure waste, and it dominates total run time (83% of wall-clock).
+    # HiCE keeps the longer `timeout` because ITS slow calls do return
+    # usable results (its large-B pairs are exactly the low-tree-coverage
+    # ones), so shortening HiCE's budget would drop those pairs and
+    # artificially inflate its mean tree coverage. None = same as timeout.
+    if dice_timeout is None:
+        dice_timeout = timeout
 
-    X, metric, types = load_openml(dataset, LINKAGE)
+    X, metric, types = load_openml_cached(dataset, LINKAGE)
     if metric != 'euclidean':
         raise ValueError(
             f"'{dataset}' resolved to metric={metric!r}; this diversity "
@@ -253,13 +344,19 @@ def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
 
     cf = hiceCounterfactuals(X=X, Z=Z, metric=metric, linkage=LINKAGE, anchor='min')
 
-    which_list = ['method', 'dice', 'baycon_random', 'baycon_proximal']
+    which_list = list(WHICH_LIST)
     pairs = cf.enumerate_pairs(min_leaf, max_leaf, max_pairs, seed=seed)
 
     # per-(pair, method) resumability: a run killed partway through (e.g. an
     # OOM kill) restarts from exactly where it left off rather than redoing
     # completed (pair, method) combinations or -- worse -- the whole dataset.
     done_pairs = _pairs_done_in_csv(out_csv, dataset_label, LINKAGE)
+    # Count only the methods THIS run is asked to produce. The file may carry
+    # rows for other methods (e.g. seeded DiCE/BayCon rows that must not be
+    # recomputed), and comparing that larger count against
+    # len(pairs) * len(which_list) made a HiCE-only run skip every dataset as
+    # "already complete" while 113 HiCE rows were deliberately missing.
+    done_pairs = {pw for pw in done_pairs if pw[1] in which_list}
     if len(done_pairs) >= len(pairs) * len(which_list):
         print(f"[skip] all {len(pairs)} pairs x {which_list} already present for "
               f"'{dataset_label}'/{LINKAGE} in {out_csv}; nothing to do.")
@@ -321,8 +418,10 @@ def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
                 err = ''; cfs = []; n_returned = 0
                 t0 = time.perf_counter()
                 try:
-                    with time_limit(timeout):
-                        cfs, n_returned = _hice_multi(cf, B_lv, A_lv, k)
+                    # hard_limit, not time_limit: HiCE's solves sit in C
+                    # extensions holding the GIL, where SIGALRM cannot fire.
+                    cfs, n_returned = hard_limit(
+                        lambda: _hice_multi(cf, B_lv, A_lv, k), timeout)
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"
                 secs = time.perf_counter() - t0
@@ -338,7 +437,7 @@ def run(dataset, out_csv, k, min_leaf, max_leaf, max_pairs,
                 err = ''; cfs = []
                 t0 = time.perf_counter()
                 try:
-                    with time_limit(timeout):
+                    with time_limit(dice_timeout):
                         cfs = run_dice_baseline_multi(
                             A_pts, B_pts, comp_pts, LINKAGE, X_all=X,
                             mu_A=A_pts.mean(0), k=k, eps=eps, seed=cseed)
@@ -602,46 +701,92 @@ def plot_tree_coverage(df, out_path, order, labels, colors,
                         metric_col="tree_coverage",
                         title="Tree coverage by method"):
     """
-    Bar chart of mean tree_coverage (fraction of B's sub-branches
-    represented by at least one returned counterfactual) per method, with
-    +/- 1 std across pairs as an error bar. Unlike the proximity/diversity
-    coverage curves, tree coverage isn't ranked by "closeness" -- it's a
-    per-pair fraction in [0, 1] regardless of how proximal the CFs that
-    earned it are -- so it's shown on its own as a plain per-method
-    summary rather than against a most-proximal/most-diverse x-axis. A pair
-    where B is a single leaf (no sub-branches to cover) has an undefined
-    (NaN) tree_coverage and is dropped from the mean, same as a method
-    that returned no valid CFs for a pair.
+    Grouped bar chart, two bars per method, +/- 1 std across pairs as error
+    bars:
+
+      raw      : tree_coverage itself, n_subbranches_represented / n_sub --
+                 fraction of ALL of B's sub-branches represented.
+      achieved : n_subbranches_represented / min(n_sub, k_requested) --
+                 fraction of the BUDGET-ACHIEVABLE sub-branches represented.
+
+    A pair only ever returns up to k_requested counterfactuals, so when a
+    branch B has more than k_requested sub-branches, 100% raw coverage is
+    mathematically unreachable no matter how good the method is -- at most
+    k_requested of them can ever be represented. The "achieved" bar divides
+    by that reachable ceiling instead, so it isolates how well a method
+    used its budget from how big B's subtree happened to be; the gap
+    between the two bars for a method is exactly how much of its shortfall
+    from 100% raw coverage is a budget ceiling rather than a method
+    failure. The xtick label also reports what fraction of that method's
+    pairs actually hit the ceiling (n_sub > k_requested).
+
+    Unlike the proximity/diversity coverage curves, tree coverage isn't
+    ranked by "closeness" -- it's a per-pair fraction in [0, 1] regardless
+    of how proximal the CFs that earned it are -- so it's shown on its own
+    rather than against a most-proximal/most-diverse x-axis. A pair where B
+    is a single leaf (no sub-branches to cover) has undefined (NaN)
+    coverage and is dropped, same as a method that returned no valid CFs.
     """
     methods = [m for m in order if m in df["which"].unique()]
+    has_budget_cols = {"n_subbranches", "n_subbranches_represented", "k_requested"} <= set(df.columns)
 
-    bar_labels, means, stds, bar_colors, ns = [], [], [], [], []
+    bar_labels, raw_means, raw_stds, ach_means, ach_stds, bar_colors, pct_capped = \
+        [], [], [], [], [], [], []
     for m in methods:
-        vals = df.loc[df["which"] == m, metric_col].dropna()
-        if len(vals) == 0:
+        sub = df[df["which"] == m]
+        raw_vals = sub[metric_col].dropna()
+        if len(raw_vals) == 0:
             continue
         bar_labels.append(labels.get(m, m))
-        means.append(vals.mean() * 100)
-        stds.append(vals.std() * 100 if len(vals) > 1 else 0)
+        raw_means.append(raw_vals.mean() * 100)
+        raw_stds.append(raw_vals.std() * 100 if len(raw_vals) > 1 else 0)
         bar_colors.append(colors.get(m, "#4a3aa7"))
-        ns.append(len(vals))
 
-    fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+        if has_budget_cols:
+            b = sub[["n_subbranches", "n_subbranches_represented", "k_requested"]].dropna()
+            achievable = np.minimum(b["n_subbranches"], b["k_requested"])
+            ach_vals = (b["n_subbranches_represented"] / achievable).replace(
+                [np.inf, -np.inf], np.nan).dropna()
+            ach_means.append(ach_vals.mean() * 100 if len(ach_vals) else np.nan)
+            ach_stds.append(ach_vals.std() * 100 if len(ach_vals) > 1 else 0)
+            pct_capped.append((b["n_subbranches"] > b["k_requested"]).mean()
+                               if len(b) else np.nan)
+        else:
+            ach_means.append(np.nan)
+            ach_stds.append(0)
+            pct_capped.append(np.nan)
+
+    fig, ax = plt.subplots(figsize=(8, 5.5), dpi=150)
     x = np.arange(len(bar_labels))
-    ax.bar(x, means, yerr=stds, color=bar_colors, width=0.6,
-           capsize=4, error_kw=dict(ecolor="#52514e", linewidth=1.2))
+    width = 0.35
+    ax.bar(x - width / 2, raw_means, width, yerr=raw_stds, color=bar_colors,
+           alpha=0.55, capsize=3, error_kw=dict(ecolor="#52514e", linewidth=1.0),
+           label="raw (% of all sub-branches)")
+    ax.bar(x + width / 2, ach_means, width, yerr=ach_stds, color=bar_colors,
+           capsize=3, error_kw=dict(ecolor="#52514e", linewidth=1.0),
+           label="achieved (% of budget-reachable sub-branches)")
 
+    xticklabels = [
+        f"{lbl}\n({pc:.0%} budget-capped)" if np.isfinite(pc) else lbl
+        for lbl, pc in zip(bar_labels, pct_capped)
+    ]
     ax.set_xticks(x)
-    ax.set_xticklabels([f"{lbl}\n(n={n})" for lbl, n in zip(bar_labels, ns)])
-    ax.set_ylabel("Mean tree coverage (% of B's sub-branches represented)")
+    ax.set_xticklabels(xticklabels)
+    ax.set_ylabel("Mean tree coverage (%)")
     ax.set_title(title, color="#0b0b0b", fontsize=13, pad=12)
     ax.set_ylim(bottom=0)
     _style_axes(ax)
     ax.xaxis.grid(False)
+    ax.legend(frameon=False, fontsize=9, loc="lower right")
     fig.tight_layout()
     fig.savefig(out_path, facecolor="white")
     plt.close(fig)
     print(f"[plot] wrote {out_path}")
+
+
+USE_SPARSITY = False
+USE_EXHAUSTIVE = True
+WHICH_LIST = ['method', 'dice', 'baycon_random', 'baycon_proximal']
 
 
 def main():
@@ -658,18 +803,53 @@ def main():
     ap.add_argument('--eps', type=float, default=0.0)
     ap.add_argument('--timeout', type=float, default=1200,
                      help="per-call wall-clock limit in seconds (0/negative disables)")
+    ap.add_argument('--dice-timeout', type=float, default=None,
+                     help="per-call wall-clock limit for DiCE only, in seconds; "
+                          "defaults to --timeout. See run()'s note on why DiCE "
+                          "warrants a shorter budget than the other methods.")
     ap.add_argument('--no-plot', action='store_true')
+    ap.add_argument('--sparsity', action='store_true',
+                    help="HiCE solves the elastic net ||t||^2 + lam*||t||_1 "
+                         "instead of the plain squared norm. NOTE: phases 3/4 "
+                         "then fall back to multistart SLSQP and optimal=False "
+                         "regardless of exhaustive (see _hice_multi).")
+    ap.add_argument('--no-exhaustive', dest='exhaustive', action='store_false',
+                    default=True,
+                    help="phase 4 stops at the first active-set size that "
+                         "yields a feasible point instead of enumerating every "
+                         "size. Only pairs that REACH phase 4 can differ, and a "
+                         "paired A/B found identical ||t|| on 150/150 pairs, so "
+                         "this mainly removes the runtime tail.")
+    ap.add_argument('--methods', type=str, nargs='+',
+                    default=['method', 'dice', 'baycon_random', 'baycon_proximal'],
+                    help="which methods to run; use --methods method for a "
+                         "HiCE-only run.")
     a = ap.parse_args()
+    global USE_SPARSITY, USE_EXHAUSTIVE, WHICH_LIST
+    USE_SPARSITY = a.sparsity
+    USE_EXHAUSTIVE = a.exhaustive
+    WHICH_LIST = list(a.methods)
 
     timeout = a.timeout if a.timeout and a.timeout > 0 else None
+    dice_timeout = (a.dice_timeout if a.dice_timeout and a.dice_timeout > 0
+                    else (None if a.dice_timeout is not None else timeout))
 
     for dataset in a.dataset:
         print(f"\n===== dataset: {dataset} =====")
         try:
             run(dataset, a.out, a.k, a.min_leaf, a.max_leaf, a.max_pairs,
-                seed=a.seed, eps=a.eps, timeout=timeout)
+                seed=a.seed, eps=a.eps, timeout=timeout,
+                dice_timeout=dice_timeout)
         except ValueError as e:
             print(f"[skip] '{dataset}': {e}")
+            continue
+        except Exception as e:
+            # One dataset failing (a dead OpenML, a blocked route) must not
+            # end a multi-day run. This gap is why the Ward run was set to
+            # die at its final dataset once openml.org became unreachable:
+            # OpenMLServerError is not a ValueError, so it propagated.
+            print(f"[error] '{dataset}': {type(e).__name__}: {e} "
+                  f"-- continuing with the next dataset", flush=True)
             continue
 
     if a.no_plot:
